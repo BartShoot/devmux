@@ -14,9 +14,11 @@ import (
 )
 
 type TUI struct {
-	app   *tview.Application
-	pages *tview.Pages
-	addr  string
+	app        *tview.Application
+	pages      *tview.Pages
+	addr       string
+	panes      []*tview.TextView
+	focusIndex int
 }
 
 func NewTUI(addr string) (*TUI, error) {
@@ -24,6 +26,7 @@ func NewTUI(addr string) (*TUI, error) {
 		app:   tview.NewApplication(),
 		pages: tview.NewPages(),
 		addr:  addr,
+		panes: []*tview.TextView{},
 	}, nil
 }
 
@@ -50,7 +53,7 @@ func (t *TUI) Run() error {
 	
 	// Create a TextView for each process
 	lines := strings.Split(strings.TrimSpace(resp.Message), "\n")
-	for _, line := range lines {
+	for i, line := range lines {
 		name := strings.Split(line, ":")[0]
 		tv := tview.NewTextView().
 			SetDynamicColors(true).
@@ -61,19 +64,37 @@ func (t *TUI) Run() error {
 		tv.SetBorder(true).SetTitle(name)
 		tv.ScrollToEnd()
 		
-		flex.AddItem(tv, 0, 1, false)
+		t.panes = append(t.panes, tv)
+		flex.AddItem(tv, 0, 1, i == 0)
 		go t.pollLogs(name, tv)
 	}
 
 	t.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Rune() == 'q' || event.Key() == tcell.KeyCtrlC {
 			t.app.Stop()
+		} else if event.Key() == tcell.KeyTab {
+			// Cycle focus
+			t.focusIndex = (t.focusIndex + 1) % len(t.panes)
+			t.updateFocus()
+			return nil // consume the event
 		}
 		return event
 	})
 
-	t.app.SetRoot(flex, true).SetFocus(flex)
+	t.updateFocus()
+	t.app.SetRoot(flex, true)
 	return t.app.Run()
+}
+
+func (t *TUI) updateFocus() {
+	for i, tv := range t.panes {
+		if i == t.focusIndex {
+			tv.SetBorderColor(tcell.ColorYellow)
+			t.app.SetFocus(tv)
+		} else {
+			tv.SetBorderColor(tcell.ColorWhite)
+		}
+	}
 }
 
 func (t *TUI) pollLogs(name string, tv *tview.TextView) {
