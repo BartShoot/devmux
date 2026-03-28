@@ -1,0 +1,26 @@
+tabs:
+  - name: "Development"
+    panes:
+      - name: "Backend"
+        command: "go run test-apps/http-app/main.go"
+        health_check:
+          type: "http"
+          url: "http://localhost:8081/actuator/health"
+          interval: 5s
+          timeout: 30s
+      - name: "Frontend"
+        command: "go run test-apps/log-app/main.go"
+        health_check:
+          type: "regex"
+          pattern: "VITE v.* ready"
+          interval: 1s
+          timeout: 20s
+  - name: "Database"
+    panes:
+      - name: "Postgres"
+        command: "go run test-apps/tcp-app/main.go"
+        health_check:
+          type: "tcp"
+          address: "localhost:5432"
+          interval: 2s
+          timeout: 15s
