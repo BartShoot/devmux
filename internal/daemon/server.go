@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
 
 	"devmux/internal/protocol"
 )
@@ -79,19 +80,30 @@ func (s *Server) handleConnection(conn net.Conn) {
 				resp = protocol.Response{Status: "error", Message: fmt.Sprintf("process %s not found", req.Name)}
 			} else {
 				lines := p.Buffer.GetLines()
-				if req.Offset < len(lines) {
+				totalLines := len(lines)
+				
+				if req.Offset < totalLines {
 					lines = lines[req.Offset:]
+				} else if req.Offset > totalLines {
+					// Buffer was likely cleared
+					lines = lines[:]
 				} else {
 					lines = []string{}
 				}
-				// Combine lines into a single message for simplicity in this MVP
+				
 				message := ""
 				for _, line := range lines {
 					message += line + "\n"
 				}
-				resp = protocol.Response{Status: "ok", Message: message}
+				resp = protocol.Response{Status: "ok", Message: message, TotalLines: totalLines}
 			}
 		}
+	case "shutdown":
+		resp = protocol.Response{Status: "ok", Message: "Daemon shutting down"}
+		json.NewEncoder(conn).Encode(resp)
+		fmt.Println("Shutdown command received, cleaning up...")
+		s.pm.StopAll()
+		os.Exit(0)
 	default:
 		resp = protocol.Response{Status: "error", Message: "unknown command"}
 	}

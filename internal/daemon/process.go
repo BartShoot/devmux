@@ -63,7 +63,49 @@ type ManagedProcess struct {
 	HCCfg         config.HealthCheck
 }
 
-func (pm *ProcessManager) StartProcess(name, command string, hcCfg config.HealthCheck) error {
+func (pm *ProcessManager) RestartProcess(name string) error {
+	pm.mu.Lock()
+	p, exists := pm.processes[name]
+	pm.mu.Unlock()
+
+	if !exists {
+		return fmt.Errorf("process %s not found", name)
+	}
+
+	if p.Running {
+		fmt.Printf("Restarting %s: Killing process tree...\n", name)
+		pm.killProcessTree(p)
+		
+		// Wait for it to be cleaned up by the goroutine
+		for i := 0; i < 20; i++ {
+			pm.mu.Lock()
+			running := p.Running
+			pm.mu.Unlock()
+			if !running {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	// Capture config before deleting
+	pm.mu.Lock()
+	command := p.Command
+	hcCfg := p.HCCfg
+	buffer := p.Buffer
+	delete(pm.processes, name)
+	pm.mu.Unlock()
+
+	// Clear the buffer and add a restart message
+	buffer.Clear()
+	buffer.Write([]byte(fmt.Sprintf("\n[yellow]----------------------------------------[-]\n")))
+	buffer.Write([]byte(fmt.Sprintf("[yellow]  RESTARTING %s [-]\n", name)))
+	buffer.Write([]byte(fmt.Sprintf("[yellow]----------------------------------------[-]\n\n")))
+
+	return pm.StartProcessWithBuffer(name, command, hcCfg, buffer)
+}
+
+func (pm *ProcessManager) StartProcessWithBuffer(name, command string, hcCfg config.HealthCheck, buffer *LogBuffer) error {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
@@ -78,12 +120,11 @@ func (pm *ProcessManager) StartProcess(name, command string, hcCfg config.Health
 	var stdin io.WriteCloser
 
 	if err != nil && err.Error() == "unsupported" {
-		// Fallback for Windows or other unsupported PTY systems
 		stdout, err = cmd.StdoutPipe()
 		if err != nil {
 			return fmt.Errorf("failed to get stdout pipe: %w", err)
 		}
-		cmd.Stderr = cmd.Stdout // Redirect stderr to stdout
+		cmd.Stderr = cmd.Stdout
 		stdin, err = cmd.StdinPipe()
 		if err != nil {
 			return fmt.Errorf("failed to get stdin pipe: %w", err)
@@ -98,13 +139,12 @@ func (pm *ProcessManager) StartProcess(name, command string, hcCfg config.Health
 		stdin = ptmx
 	}
 
-	buffer := NewLogBuffer(1000)
 	hc := NewHealthChecker(hcCfg, buffer)
 
 	managed := &ManagedProcess{
 		Name:          name,
 		Command:       command,
-		PTY:           nil, // Only set if ptmx worked
+		PTY:           nil,
 		Cmd:           cmd,
 		Running:       true,
 		Buffer:        buffer,
@@ -132,7 +172,6 @@ func (pm *ProcessManager) StartProcess(name, command string, hcCfg config.Health
 			pm.mu.Unlock()
 		}()
 
-		// Capture process output in the buffer and also mirror to stdout
 		io.Copy(io.MultiWriter(os.Stdout, buffer), stdout)
 		err := cmd.Wait()
 		if err != nil {
@@ -145,29 +184,35 @@ func (pm *ProcessManager) StartProcess(name, command string, hcCfg config.Health
 	return nil
 }
 
-func (pm *ProcessManager) RestartProcess(name string) error {
+func (pm *ProcessManager) StartProcess(name, command string, hcCfg config.HealthCheck) error {
+	return pm.StartProcessWithBuffer(name, command, hcCfg, NewLogBuffer(1000))
+}
+
+func (pm *ProcessManager) StopAll() {
 	pm.mu.Lock()
-	p, exists := pm.processes[name]
+	procs := make([]*ManagedProcess, 0, len(pm.processes))
+	for _, p := range pm.processes {
+		procs = append(procs, p)
+	}
 	pm.mu.Unlock()
 
-	if !exists {
-		return fmt.Errorf("process %s not found", name)
-	}
-
-	if p.Running {
-		if err := p.Cmd.Process.Kill(); err != nil {
-			return fmt.Errorf("failed to kill process %s: %w", name, err)
+	for _, p := range procs {
+		if p.Running {
+			fmt.Printf("Stopping process %s...\n", p.Name)
+			pm.killProcessTree(p)
 		}
 	}
 
-	// Wait a bit for the old process to exit
-	time.Sleep(500 * time.Millisecond)
+	// Wait up to 2 seconds for ports to release
+	fmt.Println("Waiting for processes to release ports...")
+	time.Sleep(2 * time.Second)
+}
 
-	pm.mu.Lock()
-	command := p.Command
-	hcCfg := p.HCCfg
-	delete(pm.processes, name)
-	pm.mu.Unlock()
-
-	return pm.StartProcess(name, command, hcCfg)
+func (pm *ProcessManager) killProcessTree(p *ManagedProcess) {
+	if p.Cmd.Process == nil {
+		return
+	}
+	// On Windows, taskkill /F /T is necessary for go run trees
+	exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprintf("%d", p.Cmd.Process.Pid)).Run()
+	p.Cmd.Process.Kill() // Fallback
 }

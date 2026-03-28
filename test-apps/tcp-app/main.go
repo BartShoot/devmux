@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net"
+	"time"
 )
 
 func main() {
@@ -14,10 +15,9 @@ func main() {
 	fmt.Println("TCP server listening on :5432")
 	for {
 		conn, err := ln.Accept()
-		if err != nil {
-			fmt.Printf("Error accepting connection: %v\n", err)
-			continue
+		if err == nil {
+			fmt.Printf("[%s] Incoming connection from %s\n", time.Now().Format("15:04:05"), conn.RemoteAddr())
+			conn.Close()
 		}
-		conn.Close()
 	}
 }

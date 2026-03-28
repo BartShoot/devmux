@@ -50,3 +50,10 @@ func (lb *LogBuffer) GetLines() []string {
 	}
 	return result
 }
+
+func (lb *LogBuffer) Clear() {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	lb.lines = lb.lines[:0]
+	lb.current.Reset()
+}

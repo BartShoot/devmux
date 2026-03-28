@@ -7,6 +7,7 @@ type Request struct {
 }
 
 type Response struct {
-	Status  string `json:"status"`
-	Message string `json:"message,omitempty"`
+	Status     string `json:"status"`
+	Message    string `json:"message,omitempty"`
+	TotalLines int    `json:"total_lines,omitempty"`
 }
