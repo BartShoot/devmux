@@ -3,6 +3,7 @@ package protocol
 type Request struct {
 	Command string `json:"command"`
 	Name    string `json:"name,omitempty"`
+	Offset  int    `json:"offset,omitempty"`
 }
 
 type Response struct {

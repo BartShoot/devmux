@@ -68,6 +68,30 @@ func (s *Server) handleConnection(conn net.Conn) {
 				resp = protocol.Response{Status: "ok", Message: fmt.Sprintf("process %s restarted", req.Name)}
 			}
 		}
+	case "logs":
+		if req.Name == "" {
+			resp = protocol.Response{Status: "error", Message: "process name is required for logs"}
+		} else {
+			s.pm.mu.Lock()
+			p, exists := s.pm.processes[req.Name]
+			s.pm.mu.Unlock()
+			if !exists {
+				resp = protocol.Response{Status: "error", Message: fmt.Sprintf("process %s not found", req.Name)}
+			} else {
+				lines := p.Buffer.GetLines()
+				if req.Offset < len(lines) {
+					lines = lines[req.Offset:]
+				} else {
+					lines = []string{}
+				}
+				// Combine lines into a single message for simplicity in this MVP
+				message := ""
+				for _, line := range lines {
+					message += line + "\n"
+				}
+				resp = protocol.Response{Status: "ok", Message: message}
+			}
+		}
 	default:
 		resp = protocol.Response{Status: "error", Message: "unknown command"}
 	}

@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"devmux/internal/protocol"
+	"devmux/internal/tui"
 )
 
 func main() {
@@ -17,6 +18,17 @@ func main() {
 	}
 
 	command := os.Args[1]
+
+	if command == "ui" {
+		ui, err := tui.NewTUI("localhost:8888")
+		if err != nil {
+			log.Fatalf("Failed to start UI: %v", err)
+		}
+		if err := ui.Run(); err != nil {
+			log.Fatalf("UI error: %v", err)
+		}
+		return
+	}
 
 	conn, err := net.Dial("tcp", "localhost:8888")
 	if err != nil {
