@@ -1,11 +1,11 @@
 package tui
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
-	"encoding/json"
-
 	"strings"
+	"sync"
 	"time"
 
 	"devmux/internal/protocol"
@@ -19,14 +19,17 @@ type TUI struct {
 	addr       string
 	panes      []*tview.TextView
 	focusIndex int
+	autoScroll map[string]bool
+	mu         sync.Mutex
 }
 
 func NewTUI(addr string) (*TUI, error) {
 	return &TUI{
-		app:   tview.NewApplication(),
-		pages: tview.NewPages(),
-		addr:  addr,
-		panes: []*tview.TextView{},
+		app:        tview.NewApplication(),
+		pages:      tview.NewPages(),
+		addr:       addr,
+		panes:      []*tview.TextView{},
+		autoScroll: make(map[string]bool),
 	}, nil
 }
 
@@ -50,11 +53,13 @@ func (t *TUI) Run() error {
 
 	// Create a layout based on the response
 	flex := tview.NewFlex().SetDirection(tview.FlexRow)
-	
+
 	// Create a TextView for each process
 	lines := strings.Split(strings.TrimSpace(resp.Message), "\n")
 	for i, line := range lines {
 		name := strings.Split(line, ":")[0]
+		t.autoScroll[name] = true
+
 		tv := tview.NewTextView().
 			SetDynamicColors(true).
 			SetTextAlign(tview.AlignLeft).
@@ -62,8 +67,26 @@ func (t *TUI) Run() error {
 				t.app.Draw()
 			})
 		tv.SetBorder(true).SetTitle(name)
-		tv.ScrollToEnd()
-		
+
+		// Input capture for this specific pane
+		tv.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+			t.mu.Lock()
+			defer t.mu.Unlock()
+
+			switch event.Key() {
+			case tcell.KeyUp, tcell.KeyPgUp:
+				t.autoScroll[name] = false
+			case tcell.KeyEnd:
+				t.autoScroll[name] = true
+				tv.ScrollToEnd()
+			case tcell.KeyDown, tcell.KeyPgDn:
+				// If we press Down/PgDn, we might want to re-enable autoscroll
+				// In tview, it's hard to know if we hit the bottom, but the End key is reliable.
+				// We can also just re-enable it on Down if we're feeling bold.
+			}
+			return event
+		})
+
 		t.panes = append(t.panes, tv)
 		flex.AddItem(tv, 0, 1, i == 0)
 		go t.pollLogs(name, tv)
@@ -136,6 +159,14 @@ func (t *TUI) pollLogs(name string, tv *tview.TextView) {
 						fmt.Fprintln(tv, line)
 						offset++
 					}
+				}
+
+				t.mu.Lock()
+				shouldScroll := t.autoScroll[name]
+				t.mu.Unlock()
+
+				if shouldScroll {
+					tv.ScrollToEnd()
 				}
 				t.app.Draw()
 			}
