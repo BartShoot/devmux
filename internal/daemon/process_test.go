@@ -10,9 +10,9 @@ import (
 
 func TestProcessManager_StartProcess(t *testing.T) {
 	pm := NewProcessManager()
-	
+
 	// Use a command that exits quickly
-	err := pm.StartProcess("test-proc", "echo hello", config.HealthCheck{})
+	err := pm.StartProcess("test-proc", "echo hello", "", config.HealthCheck{})
 	if err != nil {
 		t.Fatalf("Failed to start process: %v", err)
 	}
@@ -42,9 +42,9 @@ func TestProcessManager_StartProcess(t *testing.T) {
 
 func TestProcessManager_RestartProcess(t *testing.T) {
 	pm := NewProcessManager()
-	
-	// Use a command that stays alive for a bit (ping is a good cross-platform-ish way to wait)
-	err := pm.StartProcess("restart-proc", "ping -n 5 127.0.0.1", config.HealthCheck{})
+
+	// Use a command that stays alive for a bit (sleep is simpler on Linux)
+	err := pm.StartProcess("restart-proc", "sleep 5", "", config.HealthCheck{})
 	if err != nil {
 		t.Fatalf("Failed to start process: %v", err)
 	}
@@ -99,8 +99,7 @@ func TestProcessManager_HealthCheckIntegration(t *testing.T) {
 	go pm.RunHealthChecks(ctx)
 
 	// Start a process with a regex health check
-	// cmd.exe /c echo READY will print READY\r\n
-	err := pm.StartProcess("health-proc", "echo READY", config.HealthCheck{
+	err := pm.StartProcess("health-proc", "echo READY", "", config.HealthCheck{
 		Type:    "regex",
 		Pattern: "READY",
 	})

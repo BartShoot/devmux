@@ -1,0 +1,56 @@
+# DevMux configuration equivalent to start_buddy.kdl
+# Global working directory (can be overridden per-tab or per-pane)
+cwd: "/home/bartshoot/IdeaProjects"
+
+tabs:
+  - name: "backend"
+    layout: "split"  # app-server on left, git-server and build-server stacked on right
+    panes:
+      - name: "app-server"
+        cwd: "backend-v4/application-server"
+        command: "mvn exec:java -Djdk.tls.useExtendedMasterSecret=false"
+        health_check:
+          type: "tcp"
+          address: "localhost:8080"
+          interval: 5s
+          timeout: 60s
+
+      - name: "git-server"
+        cwd: "backend-v4/git-server"
+        command: "mvn exec:java"
+        health_check:
+          type: "tcp"
+          address: "localhost:9418"
+          interval: 5s
+          timeout: 60s
+
+      - name: "build-server"
+        cwd: "backend-v4/build-rmi-server"
+        command: "sudo /usr/bin/mvn exec:java -Dmaven.repo.local=/home/bartshoot/.m2/repository -gs /home/bartshoot/.m2/settings.xml"
+        health_check:
+          type: "regex"
+          pattern: "RMI server started"
+          interval: 2s
+          timeout: 120s
+
+  - name: "registry"
+    panes:
+      - name: "qik-backend"
+        cwd: "registry"
+        command: "gradle bootrun"
+        health_check:
+          type: "http"
+          url: "http://localhost:8081/actuator/health"
+          interval: 5s
+          timeout: 60s
+
+  - name: "frontend"
+    panes:
+      - name: "frontend"
+        cwd: "frontend-v4"
+        command: "./build backend && dev/start.sh -b -m bartd"
+        health_check:
+          type: "regex"
+          pattern: "VITE v.* ready|webpack compiled|dev server running"
+          interval: 2s
+          timeout: 120s

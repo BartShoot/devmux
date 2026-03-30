@@ -2,18 +2,22 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
-	"os"
 
 	"devmux/internal/config"
 	"devmux/internal/daemon"
+	"devmux/internal/protocol"
 )
 
 func main() {
+	verbose := flag.Bool("v", false, "verbose: print process output to stdout")
+	flag.Parse()
+
 	configPath := "devmux.yaml"
-	if len(os.Args) > 1 {
-		configPath = os.Args[1]
+	if flag.NArg() > 0 {
+		configPath = flag.Arg(0)
 	}
 
 	cfg, err := config.Load(configPath)
@@ -22,20 +26,38 @@ func main() {
 	}
 
 	pm := daemon.NewProcessManager()
+	pm.SetVerbose(*verbose)
 	ctx := context.Background()
 	go pm.RunHealthChecks(ctx)
 
 	fmt.Printf("Successfully loaded configuration from %s\n", configPath)
-	for _, tab := range cfg.Tabs {
-		for _, pane := range tab.Panes {
-			fmt.Printf("Starting process: %s\n", pane.Name)
-			if err := pm.StartProcess(pane.Name, pane.Command, pane.HealthCheck); err != nil {
+
+	// Build layout for TUI
+	layout := &protocol.Layout{
+		Tabs: make([]protocol.TabLayout, len(cfg.Tabs)),
+	}
+
+	for i := range cfg.Tabs {
+		tab := &cfg.Tabs[i]
+		layout.Tabs[i] = protocol.TabLayout{
+			Name:   tab.Name,
+			Layout: tab.Layout,
+			Panes:  make([]protocol.PaneLayout, len(tab.Panes)),
+		}
+
+		for j := range tab.Panes {
+			pane := &tab.Panes[j]
+			layout.Tabs[i].Panes[j] = protocol.PaneLayout{Name: pane.Name}
+
+			cwd := cfg.ResolveCwd(tab, pane)
+			fmt.Printf("Starting process: %s (cwd: %s)\n", pane.Name, cwd)
+			if err := pm.StartProcess(pane.Name, pane.Command, cwd, pane.HealthCheck); err != nil {
 				log.Printf("Failed to start process %s: %v", pane.Name, err)
 			}
 		}
 	}
 
-	server := daemon.NewServer("devmux.sock", pm)
+	server := daemon.NewServer("devmux.sock", pm, layout)
 	if err := server.Start(); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}

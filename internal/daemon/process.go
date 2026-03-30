@@ -16,12 +16,18 @@ import (
 type ProcessManager struct {
 	processes map[string]*ManagedProcess
 	mu        sync.Mutex
+	verbose   bool // if true, copy process output to stdout
 }
 
 func NewProcessManager() *ProcessManager {
 	return &ProcessManager{
 		processes: make(map[string]*ManagedProcess),
+		verbose:   false,
 	}
+}
+
+func (pm *ProcessManager) SetVerbose(v bool) {
+	pm.verbose = v
 }
 
 func (pm *ProcessManager) RunHealthChecks(ctx context.Context) {
@@ -58,6 +64,7 @@ func (pm *ProcessManager) RunHealthChecks(ctx context.Context) {
 type ManagedProcess struct {
 	Name          string
 	Command       string
+	Cwd           string
 	PTY           *os.File
 	Cmd           *exec.Cmd
 	Running       bool
@@ -79,7 +86,7 @@ func (pm *ProcessManager) RestartProcess(name string) error {
 	if p.Running {
 		fmt.Printf("Restarting %s: Killing process tree...\n", name)
 		pm.killProcessTree(p)
-		
+
 		// Wait for it to be cleaned up by the goroutine
 		for i := 0; i < 20; i++ {
 			pm.mu.Lock()
@@ -95,6 +102,7 @@ func (pm *ProcessManager) RestartProcess(name string) error {
 	// Capture config before deleting
 	pm.mu.Lock()
 	command := p.Command
+	cwd := p.Cwd
 	hcCfg := p.HCCfg
 	buffer := p.Buffer
 	delete(pm.processes, name)
@@ -106,10 +114,10 @@ func (pm *ProcessManager) RestartProcess(name string) error {
 	buffer.Write([]byte(fmt.Sprintf("[yellow]  RESTARTING %s [-]\n", name)))
 	buffer.Write([]byte(fmt.Sprintf("[yellow]----------------------------------------[-]\n\n")))
 
-	return pm.StartProcessWithBuffer(name, command, hcCfg, buffer)
+	return pm.StartProcessWithBuffer(name, command, cwd, hcCfg, buffer)
 }
 
-func (pm *ProcessManager) StartProcessWithBuffer(name, command string, hcCfg config.HealthCheck, buffer *LogBuffer) error {
+func (pm *ProcessManager) StartProcessWithBuffer(name, command, cwd string, hcCfg config.HealthCheck, buffer *LogBuffer) error {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
@@ -117,13 +125,32 @@ func (pm *ProcessManager) StartProcessWithBuffer(name, command string, hcCfg con
 		return fmt.Errorf("process with name %s already exists", name)
 	}
 
-	cmd := exec.Command("cmd.exe", "/c", command)
-	ptmx, err := pty.Start(cmd)
-	
+	// Use platform-appropriate shell
+	cmd := shellCommand(command)
+
+	// Set working directory if specified
+	if cwd != "" {
+		cmd.Dir = cwd
+	}
+
+	// Set process group for proper signal handling (platform-specific)
+	setProcessGroup(cmd)
+
+	ptmx, ptyErr := pty.Start(cmd)
+
 	var stdout io.ReadCloser
 	var stdin io.WriteCloser
 
-	if err != nil && err.Error() == "unsupported" {
+	if ptyErr != nil {
+		// PTY failed (unsupported, sandboxed, or other reason) - fall back to pipes
+		// Need to recreate cmd since pty.Start may have modified it
+		cmd = shellCommand(command)
+		if cwd != "" {
+			cmd.Dir = cwd
+		}
+		setProcessGroup(cmd)
+
+		var err error
 		stdout, err = cmd.StdoutPipe()
 		if err != nil {
 			return fmt.Errorf("failed to get stdout pipe: %w", err)
@@ -133,11 +160,9 @@ func (pm *ProcessManager) StartProcessWithBuffer(name, command string, hcCfg con
 		if err != nil {
 			return fmt.Errorf("failed to get stdin pipe: %w", err)
 		}
-		if err := cmd.Start(); err != nil {
+		if err = cmd.Start(); err != nil {
 			return fmt.Errorf("failed to start process: %w", err)
 		}
-	} else if err != nil {
-		return fmt.Errorf("failed to start process in PTY: %w", err)
 	} else {
 		stdout = ptmx
 		stdin = ptmx
@@ -148,6 +173,7 @@ func (pm *ProcessManager) StartProcessWithBuffer(name, command string, hcCfg con
 	managed := &ManagedProcess{
 		Name:          name,
 		Command:       command,
+		Cwd:           cwd,
 		PTY:           nil,
 		Cmd:           cmd,
 		Running:       true,
@@ -156,12 +182,15 @@ func (pm *ProcessManager) StartProcessWithBuffer(name, command string, hcCfg con
 		Status:        StatusChecking,
 		HCCfg:         hcCfg,
 	}
-	
+
 	if ptmx != nil {
 		managed.PTY = ptmx
 	}
 
 	pm.processes[name] = managed
+
+	// Capture verbose flag before goroutine
+	verbose := pm.verbose
 
 	go func() {
 		defer func() {
@@ -176,20 +205,27 @@ func (pm *ProcessManager) StartProcessWithBuffer(name, command string, hcCfg con
 			pm.mu.Unlock()
 		}()
 
-		io.Copy(io.MultiWriter(os.Stdout, buffer), stdout)
+		var writer io.Writer = buffer
+		if verbose {
+			writer = io.MultiWriter(os.Stdout, buffer)
+		}
+		io.Copy(writer, stdout)
+
 		err := cmd.Wait()
-		if err != nil {
-			fmt.Printf("Process %s exited with error: %v\n", name, err)
-		} else {
-			fmt.Printf("Process %s exited cleanly\n", name)
+		if verbose {
+			if err != nil {
+				fmt.Printf("Process %s exited with error: %v\n", name, err)
+			} else {
+				fmt.Printf("Process %s exited cleanly\n", name)
+			}
 		}
 	}()
 
 	return nil
 }
 
-func (pm *ProcessManager) StartProcess(name, command string, hcCfg config.HealthCheck) error {
-	return pm.StartProcessWithBuffer(name, command, hcCfg, NewLogBuffer(1000))
+func (pm *ProcessManager) StartProcess(name, command, cwd string, hcCfg config.HealthCheck) error {
+	return pm.StartProcessWithBuffer(name, command, cwd, hcCfg, NewLogBuffer(1000))
 }
 
 func (pm *ProcessManager) StopAll() {
@@ -212,11 +248,3 @@ func (pm *ProcessManager) StopAll() {
 	time.Sleep(2 * time.Second)
 }
 
-func (pm *ProcessManager) killProcessTree(p *ManagedProcess) {
-	if p.Cmd.Process == nil {
-		return
-	}
-	// On Windows, taskkill /F /T is necessary for go run trees
-	exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprintf("%d", p.Cmd.Process.Pid)).Run()
-	p.Cmd.Process.Kill() // Fallback
-}

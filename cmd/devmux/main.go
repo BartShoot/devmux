@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 
+	"devmux/internal/daemon"
 	"devmux/internal/protocol"
 	"devmux/internal/tui"
 )
@@ -32,7 +33,7 @@ func main() {
 	}
 
 	if command == "ui" {
-		ui, err := tui.NewTUI("localhost:8888")
+		ui, err := tui.NewTUI(daemon.GetSocketNetwork(), daemon.GetSocketPath())
 		if err != nil {
 			log.Fatalf("Failed to start UI: %v", err)
 		}
@@ -42,7 +43,7 @@ func main() {
 		return
 	}
 
-	conn, err := net.Dial("tcp", "localhost:8888")
+	conn, err := net.Dial(daemon.GetSocketNetwork(), daemon.GetSocketPath())
 	if err != nil {
 		if command == "stop" {
 			fmt.Println("Daemon is not running.")
