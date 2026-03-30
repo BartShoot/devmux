@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"encoding/json"
-	"fmt"
 	"net"
 	"os"
 	"sync"
@@ -54,7 +53,7 @@ func (cm *ClientManager) AddClient(conn net.Conn, server *Server) *StreamingClie
 		decoder:    json.NewDecoder(conn),
 		server:     server,
 		subscribed: make(map[protocol.PaneID]bool),
-		sendCh:     make(chan *protocol.ServerMessage, 100),
+		sendCh:     make(chan *protocol.ServerMessage, 1000),
 		closeCh:    make(chan struct{}),
 	}
 	cm.nextID++
@@ -149,7 +148,7 @@ func (c *StreamingClient) Send(msg *protocol.ServerMessage) {
 	case c.sendCh <- msg:
 	default:
 		// Channel full, drop message (client too slow)
-		fmt.Printf("Client %d send buffer full, dropping message\n", c.id)
+		// This is expected during heavy output bursts
 	}
 }
 

@@ -50,15 +50,15 @@ func (pm *ProcessManager) RunHealthChecks(ctx context.Context) {
 			pm.mu.Lock()
 			server := pm.server
 			for _, p := range pm.processes {
-				// Even if not running, we want to run the check one last time
-				// or keep the status if it's already healthy (for one-shots)
+				// Skip if already healthy - no need to keep polling
+				if p.Status == StatusHealthy {
+					continue
+				}
 				go func(proc *ManagedProcess) {
 					status, _ := proc.HealthChecker.Check(ctx)
 					pm.mu.Lock()
 					oldStatus := proc.Status
 					oldRunning := proc.Running
-					// For one-shots, if it WAS healthy, keep it healthy
-					// unless the check now says otherwise.
 					if status == StatusHealthy || proc.Status == StatusChecking {
 						proc.Status = status
 					} else if !proc.Running {
