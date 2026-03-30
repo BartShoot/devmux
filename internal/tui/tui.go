@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"devmux/internal/protocol"
+
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
@@ -68,11 +69,10 @@ type TUI struct {
 	tabBar     *tview.TextView
 	network    string
 	addr       string
-	panes      map[string]*tview.TextView
-	paneNames  map[*tview.TextView]string // reverse lookup: view -> name
-	paneList   []*tview.TextView          // ordered list for focus cycling
+	panes      map[string]*TerminalView
+	paneNames  map[tview.Primitive]string // reverse lookup: view -> name
+	paneList   []tview.Primitive          // ordered list for focus cycling
 	focusIndex int
-	autoScroll map[string]bool
 	mu         sync.Mutex
 	tabs       []string
 	currentTab int
@@ -80,15 +80,14 @@ type TUI struct {
 
 func NewTUI(network, addr string) (*TUI, error) {
 	return &TUI{
-		app:        tview.NewApplication(),
-		pages:      tview.NewPages(),
-		network:    network,
-		addr:       addr,
-		panes:      make(map[string]*tview.TextView),
-		paneNames:  make(map[*tview.TextView]string),
-		paneList:   []*tview.TextView{},
-		autoScroll: make(map[string]bool),
-		tabs:       []string{},
+		app:       tview.NewApplication(),
+		pages:     tview.NewPages(),
+		network:   network,
+		addr:      addr,
+		panes:     make(map[string]*TerminalView),
+		paneNames: make(map[tview.Primitive]string),
+		paneList:  []tview.Primitive{},
+		tabs:      []string{},
 	}, nil
 }
 
@@ -158,6 +157,36 @@ func (t *TUI) Run() error {
 			}
 			return nil
 		}
+
+		// Forward input to focused pane
+		if t.focusIndex < len(t.paneList) {
+			if name, ok := t.paneNames[t.paneList[t.focusIndex]]; ok {
+				switch event.Key() {
+				case tcell.KeyEnter:
+					go t.sendInput(name, "\n")
+					return nil
+				case tcell.KeyBackspace, tcell.KeyBackspace2:
+					go t.sendInput(name, "\x7f")
+					return nil
+				case tcell.KeyCtrlD:
+					go t.sendInput(name, "\x04")
+					return nil
+				case tcell.KeyEscape:
+					go t.sendInput(name, "\x1b")
+					return nil
+				case tcell.KeyUp:
+					go t.sendInput(name, "\x1b[A")
+					return nil
+				case tcell.KeyDown:
+					go t.sendInput(name, "\x1b[B")
+					return nil
+				case tcell.KeyRune:
+					go t.sendInput(name, string(event.Rune()))
+					return nil
+				}
+			}
+		}
+
 		return event
 	})
 
@@ -168,6 +197,14 @@ func (t *TUI) Run() error {
 
 	// Start status polling to update pane titles
 	go t.pollStatus()
+
+	// Periodic redraw for terminal updates
+	go func() {
+		for {
+			time.Sleep(50 * time.Millisecond)
+			t.app.Draw()
+		}
+	}()
 
 	t.app.SetRoot(mainFlex, true)
 	if len(t.paneList) > 0 {
@@ -202,15 +239,14 @@ func (t *TUI) buildTabContent(tab protocol.TabLayout) tview.Primitive {
 		return tview.NewBox()
 	}
 
-	// Create TextViews for each pane
-	var paneViews []*tview.TextView
+	// Create TerminalViews for each pane
+	var paneViews []tview.Primitive
 	for _, pane := range tab.Panes {
 		tv := t.createPaneView(pane.Name)
 		paneViews = append(paneViews, tv)
 		t.panes[pane.Name] = tv
-		t.paneNames[tv] = pane.Name // reverse lookup
+		t.paneNames[tv] = pane.Name
 		t.paneList = append(t.paneList, tv)
-		t.autoScroll[pane.Name] = true
 	}
 
 	// Apply layout
@@ -252,55 +288,8 @@ func (t *TUI) buildTabContent(tab protocol.TabLayout) tview.Primitive {
 	}
 }
 
-func (t *TUI) createPaneView(name string) *tview.TextView {
-	tv := tview.NewTextView().
-		SetDynamicColors(true).
-		SetScrollable(true).
-		SetTextAlign(tview.AlignLeft).
-		SetChangedFunc(func() {
-			t.app.Draw()
-		})
-	tv.SetBorder(true).SetTitle(" " + name + " ")
-
-	// Input capture for scrolling and typing
-	tv.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		switch event.Key() {
-		case tcell.KeyUp, tcell.KeyPgUp:
-			t.mu.Lock()
-			t.autoScroll[name] = false
-			t.mu.Unlock()
-			return event
-		case tcell.KeyEnd:
-			t.mu.Lock()
-			t.autoScroll[name] = true
-			t.mu.Unlock()
-			tv.ScrollToEnd()
-			return event
-		case tcell.KeyDown, tcell.KeyPgDn:
-			return event
-		case tcell.KeyEnter:
-			go t.sendInput(name, "\n")
-			return nil
-		case tcell.KeyBackspace, tcell.KeyBackspace2:
-			go t.sendInput(name, "\x7f") // DEL character
-			return nil
-		case tcell.KeyCtrlC:
-			// Send interrupt signal (handled by app-level capture for quit)
-			return event
-		case tcell.KeyCtrlD:
-			go t.sendInput(name, "\x04") // EOF
-			return nil
-		case tcell.KeyEscape:
-			go t.sendInput(name, "\x1b") // ESC
-			return nil
-		case tcell.KeyRune:
-			// Regular character input
-			go t.sendInput(name, string(event.Rune()))
-			return nil
-		}
-		return event
-	})
-
+func (t *TUI) createPaneView(name string) *TerminalView {
+	tv := NewTerminalView(name)
 	return tv
 }
 
@@ -314,7 +303,6 @@ func (t *TUI) sendInput(name, input string) {
 
 	req := protocol.Request{Command: "input", Name: name, Input: input}
 	json.NewEncoder(conn).Encode(req)
-	// We don't need to wait for the response
 }
 
 func (t *TUI) switchTab(index int) {
@@ -343,19 +331,21 @@ func (t *TUI) updateTabBar() {
 }
 
 func (t *TUI) updateFocus() {
-	for i, tv := range t.paneList {
-		if i == t.focusIndex {
-			tv.SetBorderColor(tcell.ColorYellow)
-			t.app.SetFocus(tv)
-		} else {
-			tv.SetBorderColor(tcell.ColorWhite)
+	for i, prim := range t.paneList {
+		if tv, ok := prim.(*TerminalView); ok {
+			if i == t.focusIndex {
+				tv.SetBorderColor(tcell.ColorYellow)
+				t.app.SetFocus(tv)
+			} else {
+				tv.SetBorderColor(tcell.ColorWhite)
+			}
 		}
 	}
 }
 
-func (t *TUI) pollLogs(name string, tv *tview.TextView) {
-	offset := 0
+func (t *TUI) pollLogs(name string, tv *TerminalView) {
 	dialer := &net.Dialer{Timeout: 200 * time.Millisecond}
+	offset := 0
 
 	for {
 		conn, err := dialer.Dial(t.network, t.addr)
@@ -364,51 +354,33 @@ func (t *TUI) pollLogs(name string, tv *tview.TextView) {
 			return
 		}
 
-		req := protocol.Request{Command: "logs", Name: name, Offset: offset}
+		// Request raw logs (we'll pass them through the terminal emulator)
+		req := protocol.Request{Command: "logs-raw", Name: name, Offset: offset}
 		if err := json.NewEncoder(conn).Encode(req); err != nil {
 			conn.Close()
-			time.Sleep(1 * time.Second)
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 
 		var resp protocol.Response
 		if err := json.NewDecoder(conn).Decode(&resp); err != nil {
 			conn.Close()
-			time.Sleep(1 * time.Second)
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		conn.Close()
 
 		if resp.Status == "ok" {
-			if offset > resp.TotalLines {
-				// Buffer was cleared, reset
-				tv.Clear()
-				offset = 0
-			}
-
+			// TotalLines in this context is the total bytes (reusing the field)
 			if resp.Message != "" {
-				lines := strings.Split(resp.Message, "\n")
-				for _, line := range lines {
-					if line != "" {
-						// Convert ANSI codes to tview tags
-						converted := convertANSIToTview(line)
-						fmt.Fprintln(tv, converted)
-						offset++
-					}
-				}
-
-				t.mu.Lock()
-				shouldScroll := t.autoScroll[name]
-				t.mu.Unlock()
-
-				if shouldScroll {
-					tv.ScrollToEnd()
-				}
-				t.app.Draw()
+				// Feed raw data to terminal emulator
+				tv.Write([]byte(resp.Message))
 			}
+			// Update offset to the new total
+			offset = resp.TotalLines
 		}
 
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -430,7 +402,6 @@ func (t *TUI) pollStatus() {
 					}
 				}
 			}
-			t.app.Draw()
 		}
 
 		time.Sleep(2 * time.Second)

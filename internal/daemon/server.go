@@ -146,6 +146,20 @@ func (s *Server) handleConnection(conn net.Conn) {
 				resp = protocol.Response{Status: "ok", Message: message, TotalLines: totalLines}
 			}
 		}
+	case "logs-raw":
+		if req.Name == "" {
+			resp = protocol.Response{Status: "error", Message: "process name is required for logs-raw"}
+		} else {
+			s.pm.mu.Lock()
+			p, exists := s.pm.processes[req.Name]
+			s.pm.mu.Unlock()
+			if !exists {
+				resp = protocol.Response{Status: "error", Message: fmt.Sprintf("process %s not found", req.Name)}
+			} else {
+				data, totalBytes, _ := p.Buffer.GetRaw(req.Offset)
+				resp = protocol.Response{Status: "ok", Message: string(data), TotalLines: totalBytes}
+			}
+		}
 	case "input":
 		if req.Name == "" {
 			resp = protocol.Response{Status: "error", Message: "process name is required for input"}

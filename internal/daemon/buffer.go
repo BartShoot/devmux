@@ -12,12 +12,17 @@ type LogBuffer struct {
 	size     int // Current number of lines stored
 	current  bytes.Buffer
 	mu       sync.RWMutex
+
+	// Raw byte buffer for terminal emulation
+	rawBuf     []byte
+	rawMaxSize int
 }
 
 func NewLogBuffer(maxLines int) *LogBuffer {
 	return &LogBuffer{
-		lines:    make([][]byte, maxLines),
-		maxLines: maxLines,
+		lines:      make([][]byte, maxLines),
+		maxLines:   maxLines,
+		rawMaxSize: 1024 * 1024, // 1MB raw buffer
 	}
 }
 
@@ -25,6 +30,14 @@ func (lb *LogBuffer) Write(p []byte) (n int, err error) {
 	lb.mu.Lock()
 	defer lb.mu.Unlock()
 
+	// Store raw bytes for terminal emulation
+	lb.rawBuf = append(lb.rawBuf, p...)
+	// Trim if exceeds max size (keep the newest data)
+	if len(lb.rawBuf) > lb.rawMaxSize {
+		lb.rawBuf = lb.rawBuf[len(lb.rawBuf)-lb.rawMaxSize:]
+	}
+
+	// Also store line-based for backward compatibility
 	for _, b := range p {
 		if b == '\n' {
 			lb.addLine(lb.current.Bytes())
@@ -75,8 +88,39 @@ func (lb *LogBuffer) Clear() {
 	lb.start = 0
 	lb.size = 0
 	lb.current.Reset()
+	lb.rawBuf = nil
 	// Clear the slices to help GC
 	for i := range lb.lines {
 		lb.lines[i] = nil
 	}
+}
+
+// GetRaw returns raw bytes starting from offset.
+// Returns the data, new offset (total bytes seen), and whether the buffer was truncated.
+func (lb *LogBuffer) GetRaw(offset int) (data []byte, totalBytes int, truncated bool) {
+	lb.mu.RLock()
+	defer lb.mu.RUnlock()
+
+	totalBytes = len(lb.rawBuf)
+
+	if offset >= totalBytes {
+		return nil, totalBytes, false
+	}
+
+	if offset < 0 {
+		offset = 0
+	}
+
+	// Return slice from offset to end
+	data = make([]byte, totalBytes-offset)
+	copy(data, lb.rawBuf[offset:])
+
+	return data, totalBytes, false
+}
+
+// GetRawTotal returns the total number of raw bytes in the buffer
+func (lb *LogBuffer) GetRawTotal() int {
+	lb.mu.RLock()
+	defer lb.mu.RUnlock()
+	return len(lb.rawBuf)
 }
