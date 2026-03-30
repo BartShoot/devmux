@@ -69,7 +69,8 @@ type TUI struct {
 	network    string
 	addr       string
 	panes      map[string]*tview.TextView
-	paneList   []*tview.TextView // ordered list for focus cycling
+	paneNames  map[*tview.TextView]string // reverse lookup: view -> name
+	paneList   []*tview.TextView          // ordered list for focus cycling
 	focusIndex int
 	autoScroll map[string]bool
 	mu         sync.Mutex
@@ -84,6 +85,7 @@ func NewTUI(network, addr string) (*TUI, error) {
 		network:    network,
 		addr:       addr,
 		panes:      make(map[string]*tview.TextView),
+		paneNames:  make(map[*tview.TextView]string),
 		paneList:   []*tview.TextView{},
 		autoScroll: make(map[string]bool),
 		tabs:       []string{},
@@ -164,6 +166,9 @@ func (t *TUI) Run() error {
 		go t.pollLogs(name, tv)
 	}
 
+	// Start status polling to update pane titles
+	go t.pollStatus()
+
 	t.app.SetRoot(mainFlex, true)
 	if len(t.paneList) > 0 {
 		t.app.SetFocus(t.paneList[0])
@@ -203,6 +208,7 @@ func (t *TUI) buildTabContent(tab protocol.TabLayout) tview.Primitive {
 		tv := t.createPaneView(pane.Name)
 		paneViews = append(paneViews, tv)
 		t.panes[pane.Name] = tv
+		t.paneNames[tv] = pane.Name // reverse lookup
 		t.paneList = append(t.paneList, tv)
 		t.autoScroll[pane.Name] = true
 	}
@@ -256,24 +262,59 @@ func (t *TUI) createPaneView(name string) *tview.TextView {
 		})
 	tv.SetBorder(true).SetTitle(" " + name + " ")
 
-	// Input capture for scrolling
+	// Input capture for scrolling and typing
 	tv.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		t.mu.Lock()
-		defer t.mu.Unlock()
-
 		switch event.Key() {
 		case tcell.KeyUp, tcell.KeyPgUp:
+			t.mu.Lock()
 			t.autoScroll[name] = false
+			t.mu.Unlock()
+			return event
 		case tcell.KeyEnd:
+			t.mu.Lock()
 			t.autoScroll[name] = true
+			t.mu.Unlock()
 			tv.ScrollToEnd()
+			return event
 		case tcell.KeyDown, tcell.KeyPgDn:
-			// Keep scrolling, don't change autoscroll
+			return event
+		case tcell.KeyEnter:
+			go t.sendInput(name, "\n")
+			return nil
+		case tcell.KeyBackspace, tcell.KeyBackspace2:
+			go t.sendInput(name, "\x7f") // DEL character
+			return nil
+		case tcell.KeyCtrlC:
+			// Send interrupt signal (handled by app-level capture for quit)
+			return event
+		case tcell.KeyCtrlD:
+			go t.sendInput(name, "\x04") // EOF
+			return nil
+		case tcell.KeyEscape:
+			go t.sendInput(name, "\x1b") // ESC
+			return nil
+		case tcell.KeyRune:
+			// Regular character input
+			go t.sendInput(name, string(event.Rune()))
+			return nil
 		}
 		return event
 	})
 
 	return tv
+}
+
+// sendInput sends input to a process via the daemon
+func (t *TUI) sendInput(name, input string) {
+	conn, err := net.Dial(t.network, t.addr)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	req := protocol.Request{Command: "input", Name: name, Input: input}
+	json.NewEncoder(conn).Encode(req)
+	// We don't need to wait for the response
 }
 
 func (t *TUI) switchTab(index int) {
@@ -298,7 +339,7 @@ func (t *TUI) updateTabBar() {
 			parts = append(parts, fmt.Sprintf(" %d:%s ", i+1, name))
 		}
 	}
-	t.tabBar.SetText(strings.Join(parts, "│") + "  [gray](←/→ or 1-9 to switch, Tab to cycle panes, q to quit)[-]")
+	t.tabBar.SetText(strings.Join(parts, "│") + "  [gray](←/→ switch tabs, Tab cycle panes, type to input, q quit)[-]")
 }
 
 func (t *TUI) updateFocus() {
@@ -369,4 +410,57 @@ func (t *TUI) pollLogs(name string, tv *tview.TextView) {
 
 		time.Sleep(500 * time.Millisecond)
 	}
+}
+
+// pollStatus periodically fetches process status and updates pane titles
+func (t *TUI) pollStatus() {
+	for {
+		layout, err := t.fetchLayout()
+		if err != nil {
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		if layout != nil {
+			for _, tab := range layout.Tabs {
+				for _, pane := range tab.Panes {
+					if tv, ok := t.panes[pane.Name]; ok {
+						title := t.formatPaneTitle(pane.Name, pane.Running, pane.Status)
+						tv.SetTitle(title)
+					}
+				}
+			}
+			t.app.Draw()
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// formatPaneTitle creates a title with status indicator
+func (t *TUI) formatPaneTitle(name string, running bool, status string) string {
+	var indicator string
+	var color string
+
+	if !running {
+		indicator = "✗"
+		color = "red"
+	} else {
+		switch status {
+		case "Healthy":
+			indicator = "✓"
+			color = "green"
+		case "Checking":
+			indicator = "◐"
+			color = "yellow"
+		case "Unhealthy":
+			indicator = "!"
+			color = "orange"
+		default:
+			indicator = "?"
+			color = "gray"
+		}
+	}
+
+	return fmt.Sprintf(" [%s]%s[-] %s ", color, indicator, name)
 }

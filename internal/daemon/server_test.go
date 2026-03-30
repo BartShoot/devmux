@@ -10,7 +10,7 @@ import (
 
 func TestServer_HandleConnection_Status(t *testing.T) {
 	pm := NewProcessManager()
-	server := NewServer("unused", pm)
+	server := NewServer("unused", pm, nil)
 
 	// Simulate a connection
 	clientConn, serverConn := net.Pipe()
@@ -41,7 +41,7 @@ func TestServer_HandleConnection_Status(t *testing.T) {
 
 func TestServer_HandleConnection_InvalidRequest(t *testing.T) {
 	pm := NewProcessManager()
-	server := NewServer("unused", pm)
+	server := NewServer("unused", pm, nil)
 
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()

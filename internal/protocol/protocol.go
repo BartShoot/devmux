@@ -4,6 +4,7 @@ type Request struct {
 	Command string `json:"command"`
 	Name    string `json:"name,omitempty"`
 	Offset  int    `json:"offset,omitempty"`
+	Input   string `json:"input,omitempty"` // for "input" command - data to send to process stdin
 }
 
 type Response struct {

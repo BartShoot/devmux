@@ -146,6 +146,18 @@ func (s *Server) handleConnection(conn net.Conn) {
 				resp = protocol.Response{Status: "ok", Message: message, TotalLines: totalLines}
 			}
 		}
+	case "input":
+		if req.Name == "" {
+			resp = protocol.Response{Status: "error", Message: "process name is required for input"}
+		} else if req.Input == "" {
+			resp = protocol.Response{Status: "error", Message: "input data is required"}
+		} else {
+			if err := s.pm.WriteInput(req.Name, req.Input); err != nil {
+				resp = protocol.Response{Status: "error", Message: fmt.Sprintf("failed to write input: %v", err)}
+			} else {
+				resp = protocol.Response{Status: "ok", Message: "input sent"}
+			}
+		}
 	case "shutdown":
 		resp = protocol.Response{Status: "ok", Message: "Daemon shutting down"}
 		json.NewEncoder(conn).Encode(resp)

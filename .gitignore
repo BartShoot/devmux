@@ -1,0 +1,27 @@
+# Build outputs
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go
+*.test
+
+# Third party dependencies (built from source)
+third_party/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+daemon.log
+
+# OS
+.DS_Store
+Thumbs.db

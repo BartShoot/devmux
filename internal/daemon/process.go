@@ -66,6 +66,7 @@ type ManagedProcess struct {
 	Command       string
 	Cwd           string
 	PTY           *os.File
+	Stdin         io.WriteCloser
 	Cmd           *exec.Cmd
 	Running       bool
 	Buffer        *LogBuffer
@@ -133,16 +134,18 @@ func (pm *ProcessManager) StartProcessWithBuffer(name, command, cwd string, hcCf
 		cmd.Dir = cwd
 	}
 
-	// Set process group for proper signal handling (platform-specific)
-	setProcessGroup(cmd)
-
+	// Try PTY first (don't set process group - PTY handles this differently)
 	ptmx, ptyErr := pty.Start(cmd)
 
 	var stdout io.ReadCloser
 	var stdin io.WriteCloser
 
+	// Capture verbose flag early for use in goroutines
+	verbose := pm.verbose
+
 	if ptyErr != nil {
-		// PTY failed (unsupported, sandboxed, or other reason) - fall back to pipes
+		// PTY failed - log the reason and fall back to pipes
+		fmt.Printf("PTY failed for %s: %v (falling back to pipes)\n", name, ptyErr)
 		// Need to recreate cmd since pty.Start may have modified it
 		cmd = shellCommand(command)
 		if cwd != "" {
@@ -151,11 +154,16 @@ func (pm *ProcessManager) StartProcessWithBuffer(name, command, cwd string, hcCf
 		setProcessGroup(cmd)
 
 		var err error
+		// Get stdout pipe
 		stdout, err = cmd.StdoutPipe()
 		if err != nil {
 			return fmt.Errorf("failed to get stdout pipe: %w", err)
 		}
-		cmd.Stderr = cmd.Stdout
+		// Get stderr pipe separately
+		stderr, err := cmd.StderrPipe()
+		if err != nil {
+			return fmt.Errorf("failed to get stderr pipe: %w", err)
+		}
 		stdin, err = cmd.StdinPipe()
 		if err != nil {
 			return fmt.Errorf("failed to get stdin pipe: %w", err)
@@ -163,6 +171,15 @@ func (pm *ProcessManager) StartProcessWithBuffer(name, command, cwd string, hcCf
 		if err = cmd.Start(); err != nil {
 			return fmt.Errorf("failed to start process: %w", err)
 		}
+
+		// Copy stderr to buffer (and stdout if verbose)
+		go func() {
+			var writer io.Writer = buffer
+			if verbose {
+				writer = io.MultiWriter(os.Stdout, buffer)
+			}
+			io.Copy(writer, stderr)
+		}()
 	} else {
 		stdout = ptmx
 		stdin = ptmx
@@ -175,6 +192,7 @@ func (pm *ProcessManager) StartProcessWithBuffer(name, command, cwd string, hcCf
 		Command:       command,
 		Cwd:           cwd,
 		PTY:           nil,
+		Stdin:         stdin,
 		Cmd:           cmd,
 		Running:       true,
 		Buffer:        buffer,
@@ -188,9 +206,6 @@ func (pm *ProcessManager) StartProcessWithBuffer(name, command, cwd string, hcCf
 	}
 
 	pm.processes[name] = managed
-
-	// Capture verbose flag before goroutine
-	verbose := pm.verbose
 
 	go func() {
 		defer func() {
@@ -246,5 +261,27 @@ func (pm *ProcessManager) StopAll() {
 	// Wait up to 2 seconds for ports to release
 	fmt.Println("Waiting for processes to release ports...")
 	time.Sleep(2 * time.Second)
+}
+
+// WriteInput writes data to a process's stdin
+func (pm *ProcessManager) WriteInput(name, input string) error {
+	pm.mu.Lock()
+	p, exists := pm.processes[name]
+	pm.mu.Unlock()
+
+	if !exists {
+		return fmt.Errorf("process %s not found", name)
+	}
+
+	if !p.Running {
+		return fmt.Errorf("process %s is not running", name)
+	}
+
+	if p.Stdin == nil {
+		return fmt.Errorf("process %s has no stdin", name)
+	}
+
+	_, err := p.Stdin.Write([]byte(input))
+	return err
 }
 
