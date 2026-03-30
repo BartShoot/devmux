@@ -10,8 +10,8 @@ tabs:
         cwd: "backend-v4/application-server"
         command: "mvn exec:java -Djdk.tls.useExtendedMasterSecret=false"
         health_check:
-          type: "tcp"
-          address: "localhost:8080"
+          type: "http"
+          url: "http://localhost:9090/services/internalAPI/getAppInfo"
           interval: 5s
           timeout: 60s
 

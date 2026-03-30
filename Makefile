@@ -47,12 +47,15 @@ build-cli:
 	CGO_ENABLED=$(CGO_ENABLED) $(GOBUILD) -ldflags="$(LDFLAGS)" -o $(BIN_DIR)/$(CLI_BIN) ./cmd/devmux
 
 # Build with CGO and libghostty terminal emulation
+# Daemon uses libghostty for terminal emulation
+# CLI/TUI is pure Go (no CGO) - receives rendered cells from daemon
 build-cgo: ghostty-build
 	@mkdir -p $(BIN_DIR)
+	@echo "Building daemon with libghostty..."
 	CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" \
 		$(GOBUILD) -tags ghostty -ldflags="$(LDFLAGS)" -o $(BIN_DIR)/$(DAEMON_BIN) ./cmd/devmuxd
-	CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" \
-		$(GOBUILD) -tags ghostty -ldflags="$(LDFLAGS)" -o $(BIN_DIR)/$(CLI_BIN) ./cmd/devmux
+	@echo "Building CLI (pure Go)..."
+	CGO_ENABLED=0 $(GOBUILD) -ldflags="$(LDFLAGS)" -o $(BIN_DIR)/$(CLI_BIN) ./cmd/devmux
 
 # Check for Zig compiler
 check-zig:
@@ -143,8 +146,12 @@ help:
 	@echo "Available targets:"
 	@echo ""
 	@echo "  Building:"
-	@echo "    make build       - Build daemon and CLI (no terminal emulation)"
-	@echo "    make build-cgo   - Build with libghostty terminal emulation (requires Zig)"
+	@echo "    make build       - Build daemon and CLI (stub terminal emulation)"
+	@echo "    make build-cgo   - Build daemon with libghostty, CLI pure Go (requires Zig)"
+	@echo ""
+	@echo "  Architecture:"
+	@echo "    Daemon: Terminal emulation via libghostty (CGO), push updates to TUI"
+	@echo "    CLI/TUI: Pure Go, receives rendered cells from daemon (no CGO)"
 	@echo ""
 	@echo "  libghostty:"
 	@echo "    make ghostty-fetch - Clone ghostty repository"

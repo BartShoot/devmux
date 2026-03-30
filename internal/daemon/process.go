@@ -7,16 +7,20 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"devmux/internal/config"
+	"devmux/internal/protocol"
+	"devmux/internal/terminal"
 	"github.com/creack/pty"
 )
 
 type ProcessManager struct {
 	processes map[string]*ManagedProcess
 	mu        sync.Mutex
-	verbose   bool // if true, copy process output to stdout
+	verbose   bool    // if true, copy process output to stdout
+	server    *Server // reference for notifications
 }
 
 func NewProcessManager() *ProcessManager {
@@ -30,6 +34,10 @@ func (pm *ProcessManager) SetVerbose(v bool) {
 	pm.verbose = v
 }
 
+func (pm *ProcessManager) SetServer(s *Server) {
+	pm.server = s
+}
+
 func (pm *ProcessManager) RunHealthChecks(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
@@ -40,20 +48,34 @@ func (pm *ProcessManager) RunHealthChecks(ctx context.Context) {
 			return
 		case <-ticker.C:
 			pm.mu.Lock()
+			server := pm.server
 			for _, p := range pm.processes {
-				// Even if not running, we want to run the check one last time 
+				// Even if not running, we want to run the check one last time
 				// or keep the status if it's already healthy (for one-shots)
 				go func(proc *ManagedProcess) {
 					status, _ := proc.HealthChecker.Check(ctx)
 					pm.mu.Lock()
-					// For one-shots, if it WAS healthy, keep it healthy 
+					oldStatus := proc.Status
+					oldRunning := proc.Running
+					// For one-shots, if it WAS healthy, keep it healthy
 					// unless the check now says otherwise.
 					if status == StatusHealthy || proc.Status == StatusChecking {
 						proc.Status = status
 					} else if !proc.Running {
 						proc.Status = StatusUnhealthy
 					}
+					newStatus := proc.Status
+					newRunning := proc.Running
+					name := proc.Name
 					pm.mu.Unlock()
+
+					// Broadcast status change if changed
+					if server != nil && (oldStatus != newStatus || oldRunning != newRunning) {
+						paneID := server.getPaneID(name)
+						if paneID != 0 {
+							server.BroadcastPaneStatus(paneID, newRunning, string(newStatus))
+						}
+					}
 				}(p)
 			}
 			pm.mu.Unlock()
@@ -73,18 +95,22 @@ type ManagedProcess struct {
 	HealthChecker *HealthChecker
 	Status        HealthStatus
 	HCCfg         config.HealthCheck
+	Terminal      *terminal.Terminal // Terminal emulator for this process
+	PaneID        protocol.PaneID    // Numerical ID for streaming protocol
+	updateSeq     uint64             // Sequence number for screen updates
 }
 
 func (pm *ProcessManager) RestartProcess(name string) error {
 	pm.mu.Lock()
 	p, exists := pm.processes[name]
+	running := exists && p.Running
 	pm.mu.Unlock()
 
 	if !exists {
 		return fmt.Errorf("process %s not found", name)
 	}
 
-	if p.Running {
+	if running {
 		fmt.Printf("Restarting %s: Killing process tree...\n", name)
 		pm.killProcessTree(p)
 
@@ -187,6 +213,20 @@ func (pm *ProcessManager) StartProcessWithBuffer(name, command, cwd string, hcCf
 
 	hc := NewHealthChecker(hcCfg, buffer)
 
+	// Create terminal emulator
+	// Check if we have a stored size for this pane (from previous run)
+	cols, rows := 80, 24
+	if pm.server != nil {
+		paneID := pm.server.getPaneID(name)
+		if storedCols, storedRows := pm.server.getPaneSize(paneID); storedCols > 0 && storedRows > 0 {
+			cols, rows = storedCols, storedRows
+		}
+	}
+	term, termErr := terminal.New(cols, rows)
+	if termErr != nil {
+		fmt.Printf("Warning: failed to create terminal for %s: %v\n", name, termErr)
+	}
+
 	managed := &ManagedProcess{
 		Name:          name,
 		Command:       command,
@@ -199,6 +239,7 @@ func (pm *ProcessManager) StartProcessWithBuffer(name, command, cwd string, hcCf
 		HealthChecker: hc,
 		Status:        StatusChecking,
 		HCCfg:         hcCfg,
+		Terminal:      term,
 	}
 
 	if ptmx != nil {
@@ -208,6 +249,10 @@ func (pm *ProcessManager) StartProcessWithBuffer(name, command, cwd string, hcCf
 	pm.processes[name] = managed
 
 	go func() {
+		// Cache server and paneID once discovered (avoids lock on every read)
+		var cachedServer *Server
+		var cachedPaneID protocol.PaneID
+
 		defer func() {
 			if ptmx != nil {
 				ptmx.Close()
@@ -215,16 +260,54 @@ func (pm *ProcessManager) StartProcessWithBuffer(name, command, cwd string, hcCf
 			if stdin != nil {
 				stdin.Close()
 			}
+			if term != nil {
+				term.Close()
+			}
 			pm.mu.Lock()
 			managed.Running = false
 			pm.mu.Unlock()
 		}()
 
-		var writer io.Writer = buffer
-		if verbose {
-			writer = io.MultiWriter(os.Stdout, buffer)
+		// Read output and feed to buffer, terminal, and subscribers
+		buf := make([]byte, 4096)
+		for {
+			n, err := stdout.Read(buf)
+			if n > 0 {
+				data := buf[:n]
+
+				// Write to buffer (for backward compatibility / health checks)
+				buffer.Write(data)
+
+				// Write to verbose output if enabled
+				if verbose {
+					os.Stdout.Write(data)
+				}
+
+				// Feed to terminal emulator
+				if term != nil {
+					term.Write(data)
+
+					// Lazily resolve server/paneID once available
+					if cachedServer == nil {
+						pm.mu.Lock()
+						cachedServer = pm.server
+						pm.mu.Unlock()
+					}
+					if cachedServer != nil && cachedPaneID == 0 {
+						cachedPaneID = cachedServer.getPaneID(name)
+						managed.PaneID = cachedPaneID
+					}
+
+					// Notify subscribers of screen update
+					if cachedServer != nil && cachedPaneID != 0 {
+						pm.notifyScreenUpdate(managed, cachedServer)
+					}
+				}
+			}
+			if err != nil {
+				break
+			}
 		}
-		io.Copy(writer, stdout)
 
 		err := cmd.Wait()
 		if verbose {
@@ -245,22 +328,95 @@ func (pm *ProcessManager) StartProcess(name, command, cwd string, hcCfg config.H
 
 func (pm *ProcessManager) StopAll() {
 	pm.mu.Lock()
-	procs := make([]*ManagedProcess, 0, len(pm.processes))
+	type procInfo struct {
+		proc    *ManagedProcess
+		running bool
+	}
+	procs := make([]procInfo, 0, len(pm.processes))
 	for _, p := range pm.processes {
-		procs = append(procs, p)
+		procs = append(procs, procInfo{proc: p, running: p.Running})
 	}
 	pm.mu.Unlock()
 
-	for _, p := range procs {
-		if p.Running {
-			fmt.Printf("Stopping process %s...\n", p.Name)
-			pm.killProcessTree(p)
+	for _, info := range procs {
+		if info.running {
+			fmt.Printf("Stopping process %s...\n", info.proc.Name)
+			pm.killProcessTree(info.proc)
 		}
 	}
 
 	// Wait up to 2 seconds for ports to release
 	fmt.Println("Waiting for processes to release ports...")
 	time.Sleep(2 * time.Second)
+}
+
+// notifyScreenUpdate sends a screen update to subscribers
+func (pm *ProcessManager) notifyScreenUpdate(managed *ManagedProcess, server *Server) {
+	if managed.Terminal == nil || managed.PaneID == 0 {
+		return
+	}
+
+	// Get terminal state
+	screen := managed.Terminal.GetScreen()
+	cursor := managed.Terminal.GetCursor()
+	cols, rows := managed.Terminal.Size()
+
+	// Convert to protocol format
+	cells := make([]protocol.CellData, 0, cols*rows)
+	for _, row := range screen {
+		for _, cell := range row {
+			var attrs uint8
+			if cell.Bold {
+				attrs |= protocol.AttrBold
+			}
+			if cell.Italic {
+				attrs |= protocol.AttrItalic
+			}
+			if cell.Underline {
+				attrs |= protocol.AttrUnderline
+			}
+			if cell.Strikethrough {
+				attrs |= protocol.AttrStrikethrough
+			}
+
+			cells = append(cells, protocol.CellData{
+				Char: cell.Char,
+				FG: protocol.Color{
+					R:       cell.FG.R,
+					G:       cell.FG.G,
+					B:       cell.FG.B,
+					Default: cell.FG.Default,
+				},
+				BG: protocol.Color{
+					R:       cell.BG.R,
+					G:       cell.BG.G,
+					B:       cell.BG.B,
+					Default: cell.BG.Default,
+				},
+				Attrs: attrs,
+			})
+		}
+	}
+
+	// Increment sequence number
+	seq := atomic.AddUint64(&managed.updateSeq, 1)
+
+	update := &protocol.ScreenUpdate{
+		PaneID:   managed.PaneID,
+		Sequence: seq,
+		Full:     true, // Always send full screen for now
+		Cols:     uint16(cols),
+		Rows:     uint16(rows),
+		Cells:    cells,
+		Cursor: protocol.CursorData{
+			X:       uint16(cursor.X),
+			Y:       uint16(cursor.Y),
+			Visible: cursor.Visible,
+		},
+	}
+
+	// Use coalescer to rate-limit updates to ~60fps
+	server.NotifyScreenUpdate(managed.PaneID, update)
 }
 
 // WriteInput writes data to a process's stdin

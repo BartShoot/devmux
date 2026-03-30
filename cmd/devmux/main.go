@@ -33,10 +33,8 @@ func main() {
 	}
 
 	if command == "ui" {
-		ui, err := tui.NewTUI(daemon.GetSocketNetwork(), daemon.GetSocketPath())
-		if err != nil {
-			log.Fatalf("Failed to start UI: %v", err)
-		}
+		// Use streaming TUI (works without CGO)
+		ui := tui.NewStreamingTUI(daemon.GetSocketNetwork(), daemon.GetSocketPath())
 		if err := ui.Run(); err != nil {
 			log.Fatalf("UI error: %v", err)
 		}

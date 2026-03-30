@@ -19,6 +19,7 @@ type TerminalView struct {
 	mu         sync.Mutex
 	focused    bool
 	autoScroll bool
+	scrollOff  int // scroll offset from bottom (0 = at bottom)
 }
 
 // NewTerminalView creates a new terminal view with the given name
@@ -167,12 +168,23 @@ func (tv *TerminalView) HasFocus() bool {
 func (tv *TerminalView) Write(data []byte) error {
 	tv.mu.Lock()
 	term := tv.term
+	autoScroll := tv.autoScroll
 	tv.mu.Unlock()
 
 	if term == nil {
 		return nil
 	}
-	return term.Write(data)
+
+	err := term.Write(data)
+
+	// If autoScroll is on, reset scroll offset when new data arrives
+	if autoScroll {
+		tv.mu.Lock()
+		tv.scrollOff = 0
+		tv.mu.Unlock()
+	}
+
+	return err
 }
 
 // SetAutoScroll sets whether to auto-scroll on new content
@@ -192,7 +204,41 @@ func (tv *TerminalView) GetAutoScroll() bool {
 // InputHandler returns the handler for this primitive
 func (tv *TerminalView) InputHandler() func(event *tcell.EventKey, setFocus func(p tview.Primitive)) {
 	return tv.WrapInputHandler(func(event *tcell.EventKey, setFocus func(p tview.Primitive)) {
-		// Input handling is done at the TUI level to send to daemon
+		tv.mu.Lock()
+		defer tv.mu.Unlock()
+
+		_, _, _, height := tv.GetInnerRect()
+
+		switch event.Key() {
+		case tcell.KeyUp:
+			tv.scrollOff++
+			tv.autoScroll = false
+		case tcell.KeyDown:
+			if tv.scrollOff > 0 {
+				tv.scrollOff--
+			}
+			if tv.scrollOff == 0 {
+				tv.autoScroll = true
+			}
+		case tcell.KeyPgUp:
+			tv.scrollOff += height / 2
+			tv.autoScroll = false
+		case tcell.KeyPgDn:
+			tv.scrollOff -= height / 2
+			if tv.scrollOff < 0 {
+				tv.scrollOff = 0
+			}
+			if tv.scrollOff == 0 {
+				tv.autoScroll = true
+			}
+		case tcell.KeyEnd:
+			tv.scrollOff = 0
+			tv.autoScroll = true
+		case tcell.KeyHome:
+			// Scroll to top - set large offset
+			tv.scrollOff = 10000
+			tv.autoScroll = false
+		}
 	})
 }
 

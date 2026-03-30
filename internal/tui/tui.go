@@ -1,3 +1,5 @@
+//go:build cgo && ghostty
+
 package tui
 
 import (
@@ -174,12 +176,6 @@ func (t *TUI) Run() error {
 				case tcell.KeyEscape:
 					go t.sendInput(name, "\x1b")
 					return nil
-				case tcell.KeyUp:
-					go t.sendInput(name, "\x1b[A")
-					return nil
-				case tcell.KeyDown:
-					go t.sendInput(name, "\x1b[B")
-					return nil
 				case tcell.KeyRune:
 					go t.sendInput(name, string(event.Rune()))
 					return nil
@@ -187,6 +183,7 @@ func (t *TUI) Run() error {
 			}
 		}
 
+		// Let arrow keys pass through for scrolling
 		return event
 	})
 
@@ -197,14 +194,6 @@ func (t *TUI) Run() error {
 
 	// Start status polling to update pane titles
 	go t.pollStatus()
-
-	// Periodic redraw for terminal updates
-	go func() {
-		for {
-			time.Sleep(50 * time.Millisecond)
-			t.app.Draw()
-		}
-	}()
 
 	t.app.SetRoot(mainFlex, true)
 	if len(t.paneList) > 0 {
@@ -375,12 +364,14 @@ func (t *TUI) pollLogs(name string, tv *TerminalView) {
 			if resp.Message != "" {
 				// Feed raw data to terminal emulator
 				tv.Write([]byte(resp.Message))
+				// Trigger redraw when new data arrives
+				t.app.Draw()
 			}
 			// Update offset to the new total
 			offset = resp.TotalLines
 		}
 
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
