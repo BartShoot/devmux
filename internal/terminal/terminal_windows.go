@@ -1,10 +1,10 @@
-//go:build cgo && ghostty && !windows
+//go:build cgo && ghostty && windows
 
 package terminal
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../../third_party/ghostty/include
-#cgo LDFLAGS: -L${SRCDIR}/../../third_party/ghostty/lib -lghostty-vt -lutil -lm
+#cgo LDFLAGS: -L${SRCDIR}/../../third_party/ghostty/lib -lghostty-vt
 
 #include <stdlib.h>
 #include <stdint.h>
@@ -29,8 +29,6 @@ import (
 )
 
 // MaxScrollbackBytes is the scrollback buffer size in bytes (not lines).
-// Ghostty's page list allocator uses ~1KB per 80-col line, so 10MB ≈ 10,000 lines.
-// Increase for more scrollback at the cost of memory per pane.
 const MaxScrollbackBytes = 10 * 1024 * 1024 // 10MB
 
 // Terminal represents a virtual terminal backed by libghostty
@@ -41,7 +39,7 @@ type Terminal struct {
 	rowCells    C.GhosttyRenderStateRowCells
 	cols        int
 	rows        int
-	graphemeBuf [8]C.uint32_t // reusable grapheme buffer (avoids per-cell alloc)
+	graphemeBuf [8]C.uint32_t // reusable grapheme buffer
 	mu          sync.Mutex
 }
 
@@ -59,7 +57,7 @@ type Cell struct {
 // Color represents an RGB color
 type Color struct {
 	R, G, B uint8
-	Default bool // true if using terminal default color
+	Default bool
 }
 
 // CursorState represents the cursor position and visibility
@@ -93,7 +91,6 @@ func New(cols, rows int) (*Terminal, error) {
 		return nil, fmt.Errorf("failed to create terminal: error code %d", err)
 	}
 
-
 	err = C.ghostty_render_state_new(nil, &t.renderState)
 	if err != C.GHOSTTY_SUCCESS {
 		C.ghostty_terminal_free(t.term)
@@ -114,6 +111,10 @@ func New(cols, rows int) (*Terminal, error) {
 		C.ghostty_terminal_free(t.term)
 		return nil, fmt.Errorf("failed to create row cells: error code %d", err)
 	}
+
+	// Set some default terminal modes for better pipe handling
+	// LNTM (Line Feed/New Line Mode)
+	C.ghostty_terminal_vt_write(t.term, (*C.uint8_t)(unsafe.Pointer(&[]byte("\x1b[20h")[0])), 5)
 
 	return t, nil
 }
@@ -141,7 +142,7 @@ func (t *Terminal) Close() {
 	}
 }
 
-// Write feeds data from the PTY into the terminal emulator
+// Write feeds data into the terminal
 func (t *Terminal) Write(data []byte) error {
 	if len(data) == 0 {
 		return nil
@@ -165,7 +166,6 @@ func (t *Terminal) Resize(cols, rows int) {
 }
 
 // ScrollViewport scrolls the terminal viewport.
-// action: 1=up, 2=down, 3=top, 4=bottom. amount is row count for up/down.
 func (t *Terminal) ScrollViewport(action uint8, amount int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -174,8 +174,6 @@ func (t *Terminal) ScrollViewport(action uint8, amount int) {
 	switch action {
 	case 1: // up
 		behavior.tag = C.GHOSTTY_SCROLL_VIEWPORT_DELTA
-		// CGO represents the C union as an opaque byte array.
-		// Write intptr_t delta into the first bytes of the union.
 		*(*C.intptr_t)(unsafe.Pointer(&behavior.value[0])) = C.intptr_t(-amount)
 	case 2: // down
 		behavior.tag = C.GHOSTTY_SCROLL_VIEWPORT_DELTA
@@ -190,7 +188,7 @@ func (t *Terminal) ScrollViewport(action uint8, amount int) {
 	C.ghostty_terminal_scroll_viewport(t.term, behavior)
 }
 
-// GetScrollbar returns the scrollbar state (total rows, viewport offset, viewport length).
+// GetScrollbar returns the scrollbar state.
 func (t *Terminal) GetScrollbar() (total, offset, length uint64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -234,8 +232,7 @@ func (t *Terminal) GetCursor() CursorState {
 	}
 }
 
-// GetScreen returns the current screen content as a 2D grid of cells.
-// Deprecated: use FillScreen for zero-allocation screen reading.
+// GetScreen returns the current screen content.
 func (t *Terminal) GetScreen() [][]Cell {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -270,16 +267,12 @@ func (t *Terminal) GetScreen() [][]Cell {
 	return screen
 }
 
-// FillScreen reads the terminal screen into a flat caller-owned buffer and cursor state.
-// buf must have capacity for at least cols*rows cells.
-// Returns false if the screen is not dirty (nothing changed since last call).
-// When false is returned, buf and cursor are not modified.
+// FillScreen reads the terminal screen into a flat caller-owned buffer.
 func (t *Terminal) FillScreen(buf []Cell, cursor *CursorState) bool {
 	return t.fillScreen(buf, cursor, false)
 }
 
-// ForceReadScreen reads the terminal screen unconditionally, ignoring dirty state.
-// Use for initial subscribe and after resize where the client needs a full frame.
+// ForceReadScreen reads the terminal screen unconditionally.
 func (t *Terminal) ForceReadScreen(buf []Cell, cursor *CursorState) {
 	t.fillScreen(buf, cursor, true)
 }
@@ -288,10 +281,8 @@ func (t *Terminal) fillScreen(buf []Cell, cursor *CursorState, force bool) bool 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Update render state from terminal (consumes terminal dirty flags)
 	C.ghostty_render_state_update(t.renderState, t.term)
 
-	// Check global dirty state
 	var dirty C.GhosttyRenderStateDirty
 	C.ghostty_render_state_get(t.renderState, C.GHOSTTY_RENDER_STATE_DATA_DIRTY, unsafe.Pointer(&dirty))
 
@@ -301,7 +292,6 @@ func (t *Terminal) fillScreen(buf []Cell, cursor *CursorState, force bool) bool 
 
 	partial := !force && dirty == C.GHOSTTY_RENDER_STATE_DIRTY_PARTIAL
 
-	// Read cursor state (cheap — a few CGO calls)
 	var visible C.bool
 	var hasValue C.bool
 	var cx, cy C.uint16_t
@@ -325,14 +315,12 @@ func (t *Terminal) fillScreen(buf []Cell, cursor *CursorState, force bool) bool 
 	cursor.Visible = bool(visible) && bool(hasValue)
 	cursor.Style = cursorStyle
 
-	// Iterate rows
 	C.ghostty_render_state_get(t.renderState, C.GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, unsafe.Pointer(&t.rowIter))
 
 	row := 0
 	for C.ghostty_render_state_row_iterator_next(t.rowIter) && row < t.rows {
 		rowOffset := row * t.cols
 
-		// In partial mode, skip clean rows
 		if partial {
 			var rowDirty C.bool
 			C.ghostty_render_state_row_get(t.rowIter, C.GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY, unsafe.Pointer(&rowDirty))
@@ -340,7 +328,6 @@ func (t *Terminal) fillScreen(buf []Cell, cursor *CursorState, force bool) bool 
 				row++
 				continue
 			}
-			// Reset row dirty flag
 			rowClean := C.bool(false)
 			C.ghostty_render_state_row_set(t.rowIter, C.GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY, unsafe.Pointer(&rowClean))
 		}
@@ -353,7 +340,6 @@ func (t *Terminal) fillScreen(buf []Cell, cursor *CursorState, force bool) bool 
 			col++
 		}
 
-		// Fill remaining cols as empty
 		for col < t.cols {
 			c := &buf[rowOffset+col]
 			c.Char = ' '
@@ -369,27 +355,21 @@ func (t *Terminal) fillScreen(buf []Cell, cursor *CursorState, force bool) bool 
 		row++
 	}
 
-	// Reset global dirty state
 	cleanState := C.GHOSTTY_RENDER_STATE_DIRTY_FALSE
 	C.ghostty_render_state_set(t.renderState, C.GHOSTTY_RENDER_STATE_OPTION_DIRTY, unsafe.Pointer(&cleanState))
 
 	return true
 }
 
-// readCellInto reads the current cell from the row cells iterator into dst.
-// Must be called while rowCells is positioned on a valid cell.
 func (t *Terminal) readCellInto(dst *Cell) {
-	// Get grapheme
 	var graphemeLen C.uint32_t
 	C.ghostty_render_state_row_cells_get(t.rowCells, C.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN, unsafe.Pointer(&graphemeLen))
 
 	if graphemeLen > 0 {
-		// Use fixed buffer for graphemes (covers 99.9% of cases)
 		if graphemeLen <= C.uint32_t(len(t.graphemeBuf)) {
 			C.ghostty_render_state_row_cells_get(t.rowCells, C.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF, unsafe.Pointer(&t.graphemeBuf[0]))
 			dst.Char = rune(t.graphemeBuf[0])
 		} else {
-			// Extremely rare: grapheme cluster > 8 codepoints, fall back to alloc
 			buf := make([]C.uint32_t, graphemeLen)
 			C.ghostty_render_state_row_cells_get(t.rowCells, C.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF, unsafe.Pointer(&buf[0]))
 			dst.Char = rune(buf[0])
@@ -398,7 +378,6 @@ func (t *Terminal) readCellInto(dst *Cell) {
 		dst.Char = ' '
 	}
 
-	// Get foreground color
 	var fgColor C.GhosttyColorRgb
 	fgResult := C.ghostty_render_state_row_cells_get(t.rowCells, C.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR, unsafe.Pointer(&fgColor))
 	if fgResult == C.GHOSTTY_SUCCESS {
@@ -407,7 +386,6 @@ func (t *Terminal) readCellInto(dst *Cell) {
 		dst.FG = Color{Default: true}
 	}
 
-	// Get background color
 	var bgColor C.GhosttyColorRgb
 	bgResult := C.ghostty_render_state_row_cells_get(t.rowCells, C.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR, unsafe.Pointer(&bgColor))
 	if bgResult == C.GHOSTTY_SUCCESS {
@@ -416,7 +394,6 @@ func (t *Terminal) readCellInto(dst *Cell) {
 		dst.BG = Color{Default: true}
 	}
 
-	// Get style
 	var cellStyle C.GhosttyStyle
 	cellStyle.size = C.size_t(unsafe.Sizeof(cellStyle))
 	C.ghostty_render_state_row_cells_get(t.rowCells, C.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, unsafe.Pointer(&cellStyle))
@@ -426,7 +403,6 @@ func (t *Terminal) readCellInto(dst *Cell) {
 	dst.Underline = cellStyle.underline != 0
 }
 
-// Size returns the current terminal dimensions
 func (t *Terminal) Size() (cols, rows int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()

@@ -5,6 +5,8 @@ package daemon
 import (
 	"fmt"
 	"os/exec"
+	"path/filepath"
+	"strings"
 )
 
 // setProcessGroup is a no-op on Windows (process groups work differently)
@@ -23,9 +25,19 @@ func (pm *ProcessManager) killProcessTree(p *ManagedProcess) {
 	p.Cmd.Process.Kill() // Fallback
 }
 
-// shellCommand returns the shell command for Windows
+// shellCommand returns the shell command for Windows.
+// It tries to be smart: if the command looks like a direct executable call, it avoids cmd.exe.
 func shellCommand(command string) *exec.Cmd {
-	return exec.Command("cmd.exe", "/c", command)
+	// Normalize path separators (convert / to \)
+	normalized := filepath.FromSlash(command)
+
+	// If the command doesn't contain spaces or shell redirects, run it directly
+	if !strings.ContainsAny(normalized, " <>&|") {
+		return exec.Command(normalized)
+	}
+
+	// Otherwise, wrap in cmd.exe
+	return exec.Command("cmd.exe", "/c", normalized)
 }
 
 // GetShellInfo returns shell path and arg format for logging
