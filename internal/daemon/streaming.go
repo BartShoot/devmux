@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"encoding/json"
 	"net"
 	"os"
 	"sync"
@@ -13,16 +12,16 @@ import (
 
 // StreamingClient represents a connected TUI client with persistent connection
 type StreamingClient struct {
-	id          uint64
-	conn        net.Conn
-	encoder     *json.Encoder
-	decoder     *json.Decoder
-	server      *Server
-	subscribed  map[protocol.PaneID]bool
-	sendCh      chan *protocol.ServerMessage
-	mu          sync.Mutex
-	closed      bool
-	closeCh     chan struct{}
+	id         uint64
+	conn       net.Conn
+	writer     *protocol.BinaryWriter
+	reader     *protocol.BinaryReader
+	server     *Server
+	subscribed map[protocol.PaneID]bool
+	sendCh     chan *protocol.ServerMessage
+	mu         sync.Mutex
+	closed     bool
+	closeCh    chan struct{}
 }
 
 // ClientManager manages all streaming clients
@@ -49,8 +48,8 @@ func (cm *ClientManager) AddClient(conn net.Conn, server *Server) *StreamingClie
 	client := &StreamingClient{
 		id:         cm.nextID,
 		conn:       conn,
-		encoder:    json.NewEncoder(conn),
-		decoder:    json.NewDecoder(conn),
+		writer:     protocol.NewBinaryWriter(conn),
+		reader:     protocol.NewBinaryReader(conn),
 		server:     server,
 		subscribed: make(map[protocol.PaneID]bool),
 		sendCh:     make(chan *protocol.ServerMessage, 1000),
@@ -173,21 +172,21 @@ func (c *StreamingClient) Close() {
 	c.server.clientManager.RemoveClient(c)
 }
 
-// readLoop reads and processes incoming messages
+// readLoop reads and processes incoming binary messages
 func (c *StreamingClient) readLoop() {
 	defer c.Close()
 
 	for {
-		var msg protocol.ClientMessage
-		if err := c.decoder.Decode(&msg); err != nil {
+		msg, err := c.reader.ReadClientMessage()
+		if err != nil {
 			return // Connection closed or error
 		}
 
-		c.handleMessage(&msg)
+		c.handleMessage(msg)
 	}
 }
 
-// writeLoop sends queued messages to the client
+// writeLoop sends queued messages to the client as binary frames
 func (c *StreamingClient) writeLoop() {
 	for {
 		select {
@@ -197,7 +196,7 @@ func (c *StreamingClient) writeLoop() {
 				c.mu.Unlock()
 				return
 			}
-			err := c.encoder.Encode(msg)
+			err := c.writer.WriteServerMessage(msg)
 			c.mu.Unlock()
 			if err != nil {
 				return
@@ -346,30 +345,31 @@ func setTerminalSize(f *os.File, cols, rows int) {
 	})
 }
 
-// UpdateCoalescer coalesces rapid screen updates to limit to ~60fps
+// UpdateCoalescer tracks dirty panes and materializes screen state only on flush (~60fps).
+// This avoids building CellData slices on every stdout read — only on actual sends.
 type UpdateCoalescer struct {
-	pending   map[protocol.PaneID]*protocol.ScreenUpdate
-	timer     *time.Timer
-	server    *Server
-	mu        sync.Mutex
-	interval  time.Duration
+	dirty    map[protocol.PaneID]bool
+	timer    *time.Timer
+	server   *Server
+	mu       sync.Mutex
+	interval time.Duration
 }
 
 func NewUpdateCoalescer(server *Server) *UpdateCoalescer {
 	return &UpdateCoalescer{
-		pending:  make(map[protocol.PaneID]*protocol.ScreenUpdate),
+		dirty:    make(map[protocol.PaneID]bool),
 		server:   server,
 		interval: 16 * time.Millisecond, // ~60fps
 	}
 }
 
-// QueueUpdate queues a screen update, coalescing if one is pending
-func (uc *UpdateCoalescer) QueueUpdate(update *protocol.ScreenUpdate) {
+// MarkDirty marks a pane as needing a screen update on next flush.
+// This is cheap — no allocation, no terminal state read.
+func (uc *UpdateCoalescer) MarkDirty(paneID protocol.PaneID) {
 	uc.mu.Lock()
 	defer uc.mu.Unlock()
 
-	// Replace any pending update for this pane
-	uc.pending[update.PaneID] = update
+	uc.dirty[paneID] = true
 
 	// Start timer if not already running
 	if uc.timer == nil {
@@ -377,18 +377,21 @@ func (uc *UpdateCoalescer) QueueUpdate(update *protocol.ScreenUpdate) {
 	}
 }
 
-// flush sends all pending updates
+// flush materializes screen state for dirty panes and sends to subscribers.
 func (uc *UpdateCoalescer) flush() {
 	uc.mu.Lock()
-	pending := uc.pending
-	uc.pending = make(map[protocol.PaneID]*protocol.ScreenUpdate)
+	dirty := uc.dirty
+	uc.dirty = make(map[protocol.PaneID]bool)
 	uc.timer = nil
 	uc.mu.Unlock()
 
-	for paneID, update := range pending {
-		uc.server.clientManager.BroadcastToPane(paneID, &protocol.ServerMessage{
-			Type:         protocol.MsgScreenUpdate,
-			ScreenUpdate: update,
-		})
+	for paneID := range dirty {
+		update := uc.server.materializeScreenUpdate(paneID)
+		if update != nil {
+			uc.server.clientManager.BroadcastToPane(paneID, &protocol.ServerMessage{
+				Type:         protocol.MsgScreenUpdate,
+				ScreenUpdate: update,
+			})
+		}
 	}
 }

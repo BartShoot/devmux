@@ -21,7 +21,7 @@ func TestServer_HandleConnection_Status(t *testing.T) {
 	// Run the handler in a goroutine
 	go server.handleConnection(serverConn)
 
-	// Send a status request
+	// Send a status request (legacy JSON protocol)
 	req := protocol.Request{Command: "status"}
 	err := json.NewEncoder(clientConn).Encode(req)
 	if err != nil {
@@ -64,6 +64,15 @@ func TestServer_HandleConnection_InvalidRequest(t *testing.T) {
 	}
 }
 
+// binaryStreamingConn sends the binary magic and returns writer/reader for the connection
+func binaryStreamingConn(t *testing.T, conn net.Conn) (*protocol.BinaryWriter, *protocol.BinaryReader) {
+	t.Helper()
+	if _, err := conn.Write(protocol.BinaryMagic[:]); err != nil {
+		t.Fatalf("Failed to send binary magic: %v", err)
+	}
+	return protocol.NewBinaryWriter(conn), protocol.NewBinaryReader(conn)
+}
+
 func TestServer_StreamingProtocol_GetLayout(t *testing.T) {
 	pm := NewProcessManager()
 	layout := &protocol.Layout{
@@ -86,17 +95,17 @@ func TestServer_StreamingProtocol_GetLayout(t *testing.T) {
 
 	go server.handleConnection(serverConn)
 
-	// Send GetLayout message (streaming protocol)
-	msg := protocol.ClientMessage{Type: protocol.MsgGetLayout}
-	err := json.NewEncoder(clientConn).Encode(msg)
+	w, r := binaryStreamingConn(t, clientConn)
+
+	// Send GetLayout message
+	err := w.WriteClientMessage(&protocol.ClientMessage{Type: protocol.MsgGetLayout})
 	if err != nil {
 		t.Fatalf("Failed to send request: %v", err)
 	}
 
-	// Read the response (should be LayoutMsg)
-	var resp protocol.ServerMessage
+	// Read the response
 	clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	err = json.NewDecoder(clientConn).Decode(&resp)
+	resp, err := r.ReadServerMessage()
 	if err != nil {
 		t.Fatalf("Failed to decode response: %v", err)
 	}
@@ -148,32 +157,33 @@ func TestServer_StreamingProtocol_Subscribe(t *testing.T) {
 
 	go server.handleConnection(serverConn)
 
-	// First get layout to know the pane ID
-	msg := protocol.ClientMessage{Type: protocol.MsgGetLayout}
-	json.NewEncoder(clientConn).Encode(msg)
+	w, r := binaryStreamingConn(t, clientConn)
 
-	var layoutResp protocol.ServerMessage
+	// First get layout to know the pane ID
+	w.WriteClientMessage(&protocol.ClientMessage{Type: protocol.MsgGetLayout})
+
 	clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	json.NewDecoder(clientConn).Decode(&layoutResp)
+	layoutResp, err := r.ReadServerMessage()
+	if err != nil {
+		t.Fatalf("Failed to decode layout: %v", err)
+	}
 
 	paneID := layoutResp.Layout.Tabs[0].Panes[0].ID
 
 	// Subscribe to the pane
-	subMsg := protocol.ClientMessage{
+	err = w.WriteClientMessage(&protocol.ClientMessage{
 		Type: protocol.MsgSubscribe,
 		Subscribe: &protocol.SubscribeMsg{
 			PaneIDs: []protocol.PaneID{paneID},
 		},
-	}
-	err := json.NewEncoder(clientConn).Encode(subMsg)
+	})
 	if err != nil {
 		t.Fatalf("Failed to send subscribe: %v", err)
 	}
 
 	// Should receive initial screen update
-	var screenResp protocol.ServerMessage
 	clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	err = json.NewDecoder(clientConn).Decode(&screenResp)
+	screenResp, err := r.ReadServerMessage()
 	if err != nil {
 		t.Fatalf("Failed to decode screen update: %v", err)
 	}

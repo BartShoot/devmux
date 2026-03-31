@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"devmux/internal/config"
@@ -298,9 +297,9 @@ func (pm *ProcessManager) StartProcessWithBuffer(name, command, cwd string, hcCf
 						managed.PaneID = cachedPaneID
 					}
 
-					// Notify subscribers of screen update
+					// Mark pane as dirty — actual screen materialization deferred to coalescer flush
 					if cachedServer != nil && cachedPaneID != 0 {
-						pm.notifyScreenUpdate(managed, cachedServer)
+						cachedServer.coalescer.MarkDirty(cachedPaneID)
 					}
 				}
 			}
@@ -350,74 +349,6 @@ func (pm *ProcessManager) StopAll() {
 	time.Sleep(2 * time.Second)
 }
 
-// notifyScreenUpdate sends a screen update to subscribers
-func (pm *ProcessManager) notifyScreenUpdate(managed *ManagedProcess, server *Server) {
-	if managed.Terminal == nil || managed.PaneID == 0 {
-		return
-	}
-
-	// Get terminal state
-	screen := managed.Terminal.GetScreen()
-	cursor := managed.Terminal.GetCursor()
-	cols, rows := managed.Terminal.Size()
-
-	// Convert to protocol format
-	cells := make([]protocol.CellData, 0, cols*rows)
-	for _, row := range screen {
-		for _, cell := range row {
-			var attrs uint8
-			if cell.Bold {
-				attrs |= protocol.AttrBold
-			}
-			if cell.Italic {
-				attrs |= protocol.AttrItalic
-			}
-			if cell.Underline {
-				attrs |= protocol.AttrUnderline
-			}
-			if cell.Strikethrough {
-				attrs |= protocol.AttrStrikethrough
-			}
-
-			cells = append(cells, protocol.CellData{
-				Char: cell.Char,
-				FG: protocol.Color{
-					R:       cell.FG.R,
-					G:       cell.FG.G,
-					B:       cell.FG.B,
-					Default: cell.FG.Default,
-				},
-				BG: protocol.Color{
-					R:       cell.BG.R,
-					G:       cell.BG.G,
-					B:       cell.BG.B,
-					Default: cell.BG.Default,
-				},
-				Attrs: attrs,
-			})
-		}
-	}
-
-	// Increment sequence number
-	seq := atomic.AddUint64(&managed.updateSeq, 1)
-
-	update := &protocol.ScreenUpdate{
-		PaneID:   managed.PaneID,
-		Sequence: seq,
-		Full:     true, // Always send full screen for now
-		Cols:     uint16(cols),
-		Rows:     uint16(rows),
-		Cells:    cells,
-		Cursor: protocol.CursorData{
-			X:       uint16(cursor.X),
-			Y:       uint16(cursor.Y),
-			Visible: cursor.Visible,
-		},
-	}
-
-	// Use coalescer to rate-limit updates to ~60fps
-	server.NotifyScreenUpdate(managed.PaneID, update)
-}
 
 // WriteInput writes data to a process's stdin
 func (pm *ProcessManager) WriteInput(name, input string) error {

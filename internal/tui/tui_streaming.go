@@ -11,18 +11,34 @@ import (
 	"github.com/rivo/tview"
 )
 
+// InputMode represents the current vim-like input mode
+type InputMode uint8
+
+const (
+	ModeNormal InputMode = iota
+	ModeInsert
+)
+
 // StreamingTUI is the new TUI using push-based streaming protocol
 type StreamingTUI struct {
-	app        *tview.Application
-	pages      *tview.Pages
-	tabBar     *tview.TextView
-	client     *StreamClient
-	network    string
-	addr       string
+	app       *tview.Application
+	pages     *tview.Pages
+	tabBar    *tview.TextView
+	statusBar *tview.TextView
+	client    *StreamClient
+	network   string
+	addr      string
 
-	// Pane management
-	panes      map[protocol.PaneID]*SimpleTerminalView
-	paneList   []*SimpleTerminalView
+	// Input mode
+	mode InputMode
+
+	// Pane management (global registry)
+	panes map[protocol.PaneID]*SimpleTerminalView
+
+	// Per-tab pane views (ordered), built during layout
+	tabPaneViews [][]*SimpleTerminalView
+
+	// Focus: index within current tab's panes
 	focusIndex int
 
 	// Tab management
@@ -33,9 +49,9 @@ type StreamingTUI struct {
 }
 
 type tabState struct {
-	id     protocol.TabID
-	name   string
-	panes  []protocol.PaneID
+	id    protocol.TabID
+	name  string
+	panes []protocol.PaneID
 }
 
 // NewStreamingTUI creates a new streaming TUI
@@ -46,6 +62,7 @@ func NewStreamingTUI(network, addr string) *StreamingTUI {
 		network: network,
 		addr:    addr,
 		panes:   make(map[protocol.PaneID]*SimpleTerminalView),
+		mode:    ModeNormal,
 	}
 }
 
@@ -79,31 +96,33 @@ func (t *StreamingTUI) Run() error {
 		return fmt.Errorf("failed to request layout: %w", err)
 	}
 
-	// Wait a bit for layout to arrive before setting up UI
-	// In production, we'd use a channel/sync mechanism
-	// For now, the layout handler will build the UI
-
 	// Create tab bar
 	t.tabBar = tview.NewTextView().
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignLeft)
 	t.tabBar.SetBackgroundColor(tcell.ColorDarkBlue)
 
-	// Main layout: tab bar on top, content below
+	// Create status bar
+	t.statusBar = tview.NewTextView().
+		SetDynamicColors(true).
+		SetTextAlign(tview.AlignLeft)
+	t.statusBar.SetBackgroundColor(tcell.ColorDarkBlue)
+	t.updateStatusBar()
+
+	// Main layout: tab bar on top, content in middle, status bar on bottom
 	mainFlex := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(t.tabBar, 1, 0, false).
-		AddItem(t.pages, 0, 1, true)
+		AddItem(t.pages, 0, 1, true).
+		AddItem(t.statusBar, 1, 0, false)
 
 	// Global input handling
 	t.app.SetInputCapture(t.handleInput)
 
 	// Handle window resize
 	t.app.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
-		// Check if any pane sizes changed and send resize messages
 		t.mu.Lock()
 		for paneID, tv := range t.panes {
 			width, height := tv.GetInnerSize()
-			// Store last known size to avoid spamming
 			if width > 0 && height > 0 {
 				if tv.viewCols != width || tv.viewRows != height {
 					tv.viewCols = width
@@ -113,7 +132,7 @@ func (t *StreamingTUI) Run() error {
 			}
 		}
 		t.mu.Unlock()
-		return false // Don't skip draw
+		return false
 	})
 
 	t.app.SetRoot(mainFlex, true)
@@ -128,12 +147,13 @@ func (t *StreamingTUI) handleLayout(layout *protocol.LayoutMsg) {
 
 		// Clear existing state
 		t.tabs = nil
-		t.paneList = nil
+		t.tabPaneViews = nil
 		t.panes = make(map[protocol.PaneID]*SimpleTerminalView)
 
 		// Build tabs
 		for _, tab := range layout.Tabs {
-			tabContent := t.buildTabContent(tab)
+			var tabViews []*SimpleTerminalView
+			tabContent := t.buildTabContent(tab, &tabViews)
 			t.pages.AddPage(tab.Name, tabContent, true, len(t.tabs) == 0)
 
 			paneIDs := make([]protocol.PaneID, len(tab.Panes))
@@ -145,12 +165,13 @@ func (t *StreamingTUI) handleLayout(layout *protocol.LayoutMsg) {
 				name:  tab.Name,
 				panes: paneIDs,
 			})
+			t.tabPaneViews = append(t.tabPaneViews, tabViews)
 		}
 
 		t.updateTabBar()
 
-		// Set focus to first pane
-		if len(t.paneList) > 0 {
+		// Set focus to first pane in first tab
+		if len(t.tabPaneViews) > 0 && len(t.tabPaneViews[0]) > 0 {
 			t.focusIndex = 0
 			t.updateFocus()
 		}
@@ -160,22 +181,19 @@ func (t *StreamingTUI) handleLayout(layout *protocol.LayoutMsg) {
 	})
 }
 
-// buildTabContent creates the layout for a tab
-func (t *StreamingTUI) buildTabContent(tab protocol.TabInfo) tview.Primitive {
+// buildTabContent creates the layout for a tab and collects pane views
+func (t *StreamingTUI) buildTabContent(tab protocol.TabInfo, tabViews *[]*SimpleTerminalView) tview.Primitive {
 	if len(tab.Panes) == 0 {
 		return tview.NewBox()
 	}
 
 	// Create views for each pane
-	var paneViews []*SimpleTerminalView
 	for _, pane := range tab.Panes {
 		tv := NewSimpleTerminalView(pane.ID, pane.Name)
-		// Set initial title with status from layout
 		title := formatPaneTitle(pane.Name, pane.Running, pane.Status)
 		tv.SetTitle(title)
-		paneViews = append(paneViews, tv)
+		*tabViews = append(*tabViews, tv)
 		t.panes[pane.ID] = tv
-		t.paneList = append(t.paneList, tv)
 	}
 
 	// Apply layout
@@ -187,18 +205,18 @@ func (t *StreamingTUI) buildTabContent(tab protocol.TabInfo) tview.Primitive {
 	switch layout {
 	case "horizontal":
 		flex := tview.NewFlex().SetDirection(tview.FlexColumn)
-		for _, tv := range paneViews {
+		for _, tv := range *tabViews {
 			flex.AddItem(tv, 0, 1, false)
 		}
 		return flex
 
 	case "split":
-		if len(paneViews) == 1 {
-			return paneViews[0]
+		if len(*tabViews) == 1 {
+			return (*tabViews)[0]
 		}
-		leftPane := paneViews[0]
+		leftPane := (*tabViews)[0]
 		rightFlex := tview.NewFlex().SetDirection(tview.FlexRow)
-		for _, tv := range paneViews[1:] {
+		for _, tv := range (*tabViews)[1:] {
 			rightFlex.AddItem(tv, 0, 1, false)
 		}
 		mainFlex := tview.NewFlex().SetDirection(tview.FlexColumn).
@@ -208,7 +226,7 @@ func (t *StreamingTUI) buildTabContent(tab protocol.TabInfo) tview.Primitive {
 
 	default: // vertical
 		flex := tview.NewFlex().SetDirection(tview.FlexRow)
-		for _, tv := range paneViews {
+		for _, tv := range *tabViews {
 			flex.AddItem(tv, 0, 1, false)
 		}
 		return flex
@@ -225,11 +243,7 @@ func (t *StreamingTUI) subscribeToAllPanes() {
 		t.client.SendSubscribe(paneIDs)
 	}
 
-	// Send initial resize for each pane based on actual dimensions
-	// This is deferred slightly to allow tview to calculate layout
 	go func() {
-		// Small delay to let tview compute actual sizes
-		// In a real app, you'd hook into tview's resize event
 		t.app.QueueUpdateDraw(func() {
 			t.sendResizeForAllPanes()
 		})
@@ -267,9 +281,6 @@ func (t *StreamingTUI) handleSelection(sel *protocol.SelectionMsg) {
 	if ok {
 		tv.UpdateSelection(sel)
 		t.app.QueueUpdateDraw(func() {})
-
-		// If selection has text, could copy to clipboard here
-		// For now, just update the display
 	}
 }
 
@@ -280,7 +291,6 @@ func (t *StreamingTUI) handlePaneStatus(status *protocol.PaneStatusMsg) {
 	t.mu.Unlock()
 
 	if ok {
-		// Update title with status
 		t.app.QueueUpdateDraw(func() {
 			title := formatPaneTitle(tv.name, status.Running, status.Status)
 			tv.SetTitle(title)
@@ -290,85 +300,188 @@ func (t *StreamingTUI) handlePaneStatus(status *protocol.PaneStatusMsg) {
 
 // handleError processes error messages
 func (t *StreamingTUI) handleError(err *protocol.ErrorMsg) {
-	// Could show error in status bar
 	fmt.Printf("Error from daemon: %s\n", err.Message)
 }
 
-// handleInput processes keyboard input
+// currentTabPanes returns the pane views for the currently active tab
+func (t *StreamingTUI) currentTabPanes() []*SimpleTerminalView {
+	if t.currentTab < len(t.tabPaneViews) {
+		return t.tabPaneViews[t.currentTab]
+	}
+	return nil
+}
+
+// handleInput processes keyboard input based on current mode
 func (t *StreamingTUI) handleInput(event *tcell.EventKey) *tcell.EventKey {
+	// Ctrl+C always quits regardless of mode
+	if event.Key() == tcell.KeyCtrlC {
+		t.app.Stop()
+		return nil
+	}
+
+	t.mu.Lock()
+	mode := t.mode
+	t.mu.Unlock()
+
+	switch mode {
+	case ModeNormal:
+		return t.handleNormalMode(event)
+	case ModeInsert:
+		return t.handleInsertMode(event)
+	}
+	return event
+}
+
+// handleNormalMode processes input in normal mode
+func (t *StreamingTUI) handleNormalMode(event *tcell.EventKey) *tcell.EventKey {
 	switch {
-	case event.Rune() == 'q' || event.Key() == tcell.KeyCtrlC:
+	// Quit
+	case event.Rune() == 'q':
 		t.app.Stop()
 		return nil
 
-	case event.Key() == tcell.KeyTab:
-		// Cycle focus within current tab
+	// Enter insert mode
+	case event.Rune() == 'i':
 		t.mu.Lock()
-		if len(t.paneList) > 0 {
-			t.focusIndex = (t.focusIndex + 1) % len(t.paneList)
+		t.mode = ModeInsert
+		t.mu.Unlock()
+		t.updateStatusBar()
+		return nil
+
+	// Pane navigation (within current tab)
+	case event.Rune() == 'h' || event.Rune() == 'k':
+		t.mu.Lock()
+		panes := t.currentTabPanes()
+		if len(panes) > 0 {
+			t.focusIndex = (t.focusIndex - 1 + len(panes)) % len(panes)
 			t.updateFocus()
 		}
 		t.mu.Unlock()
 		return nil
 
+	case event.Rune() == 'j' || event.Rune() == 'l':
+		t.mu.Lock()
+		panes := t.currentTabPanes()
+		if len(panes) > 0 {
+			t.focusIndex = (t.focusIndex + 1) % len(panes)
+			t.updateFocus()
+		}
+		t.mu.Unlock()
+		return nil
+
+	case event.Key() == tcell.KeyTab:
+		t.mu.Lock()
+		panes := t.currentTabPanes()
+		if len(panes) > 0 {
+			t.focusIndex = (t.focusIndex + 1) % len(panes)
+			t.updateFocus()
+		}
+		t.mu.Unlock()
+		return nil
+
+	// Tab switching with number keys
 	case event.Rune() >= '1' && event.Rune() <= '9':
-		// Switch tabs with number keys
 		tabIndex := int(event.Rune() - '1')
 		t.switchTab(tabIndex)
 		return nil
 
+	// Tab switching with arrow keys
 	case event.Key() == tcell.KeyLeft:
 		t.mu.Lock()
-		if t.currentTab > 0 {
-			t.mu.Unlock()
-			t.switchTab(t.currentTab - 1)
-		} else {
-			t.mu.Unlock()
+		idx := t.currentTab
+		t.mu.Unlock()
+		if idx > 0 {
+			t.switchTab(idx - 1)
 		}
 		return nil
 
 	case event.Key() == tcell.KeyRight:
 		t.mu.Lock()
-		if t.currentTab < len(t.tabs)-1 {
-			t.mu.Unlock()
-			t.switchTab(t.currentTab + 1)
-		} else {
-			t.mu.Unlock()
+		idx := t.currentTab
+		t.mu.Unlock()
+		if idx < len(t.tabs)-1 {
+			t.switchTab(idx + 1)
 		}
 		return nil
 	}
 
-	// Forward input to focused pane
-	t.mu.Lock()
-	if t.focusIndex < len(t.paneList) {
-		paneID := t.paneList[t.focusIndex].PaneID()
-		t.mu.Unlock()
+	return event
+}
 
-		var input string
-		switch event.Key() {
-		case tcell.KeyEnter:
-			input = "\n"
-		case tcell.KeyBackspace, tcell.KeyBackspace2:
-			input = "\x7f"
-		case tcell.KeyCtrlD:
-			input = "\x04"
-		case tcell.KeyEscape:
-			input = "\x1b"
-		case tcell.KeyRune:
-			input = string(event.Rune())
-		default:
-			return event // Let arrow keys etc pass through
-		}
-
-		if input != "" {
-			go t.client.SendInput(paneID, input)
-			return nil
-		}
-	} else {
+// handleInsertMode captures all input and forwards to the focused pane
+func (t *StreamingTUI) handleInsertMode(event *tcell.EventKey) *tcell.EventKey {
+	// Escape returns to normal mode
+	if event.Key() == tcell.KeyEscape {
+		t.mu.Lock()
+		t.mode = ModeNormal
 		t.mu.Unlock()
+		t.updateStatusBar()
+		return nil
 	}
 
-	return event
+	// Forward everything to the focused pane
+	t.mu.Lock()
+	panes := t.currentTabPanes()
+	var paneID protocol.PaneID
+	if t.focusIndex < len(panes) {
+		paneID = panes[t.focusIndex].PaneID()
+	}
+	t.mu.Unlock()
+
+	if paneID == 0 {
+		return nil
+	}
+
+	var input string
+	switch event.Key() {
+	case tcell.KeyEnter:
+		input = "\r"
+	case tcell.KeyBackspace, tcell.KeyBackspace2:
+		input = "\x7f"
+	case tcell.KeyTab:
+		input = "\t"
+	case tcell.KeyCtrlD:
+		input = "\x04"
+	case tcell.KeyCtrlA:
+		input = "\x01"
+	case tcell.KeyCtrlE:
+		input = "\x05"
+	case tcell.KeyCtrlK:
+		input = "\x0b"
+	case tcell.KeyCtrlU:
+		input = "\x15"
+	case tcell.KeyCtrlW:
+		input = "\x17"
+	case tcell.KeyCtrlL:
+		input = "\x0c"
+	case tcell.KeyCtrlZ:
+		input = "\x1a"
+	case tcell.KeyUp:
+		input = "\x1b[A"
+	case tcell.KeyDown:
+		input = "\x1b[B"
+	case tcell.KeyRight:
+		input = "\x1b[C"
+	case tcell.KeyLeft:
+		input = "\x1b[D"
+	case tcell.KeyHome:
+		input = "\x1b[H"
+	case tcell.KeyEnd:
+		input = "\x1b[F"
+	case tcell.KeyDelete:
+		input = "\x1b[3~"
+	case tcell.KeyPgUp:
+		input = "\x1b[5~"
+	case tcell.KeyPgDn:
+		input = "\x1b[6~"
+	case tcell.KeyRune:
+		input = string(event.Rune())
+	}
+
+	if input != "" {
+		go t.client.SendInput(paneID, input)
+	}
+	return nil
 }
 
 // switchTab switches to the specified tab
@@ -399,12 +512,28 @@ func (t *StreamingTUI) updateTabBar() {
 			parts = append(parts, fmt.Sprintf(" %d:%s ", i+1, tab.name))
 		}
 	}
-	t.tabBar.SetText(strings.Join(parts, "│") + "  [gray](←/→ switch tabs, Tab cycle panes, type to input, q quit)[-]")
+	t.tabBar.SetText(strings.Join(parts, "|"))
 }
 
-// updateFocus updates the visual focus indicator
+// updateStatusBar updates the status bar text with current mode.
+// Safe to call before or after app.Run — writes directly to the TextView.
+func (t *StreamingTUI) updateStatusBar() {
+	t.mu.Lock()
+	mode := t.mode
+	t.mu.Unlock()
+
+	switch mode {
+	case ModeNormal:
+		t.statusBar.SetText("[white:darkblue] -- NORMAL -- [-:-]  [gray]hjkl:focus  1-9:tab  i:insert  q:quit[-]")
+	case ModeInsert:
+		t.statusBar.SetText("[black:green] -- INSERT -- [-:-]  [gray]Esc:normal[-]")
+	}
+}
+
+// updateFocus updates the visual focus indicator for panes in current tab
 func (t *StreamingTUI) updateFocus() {
-	for i, tv := range t.paneList {
+	panes := t.currentTabPanes()
+	for i, tv := range panes {
 		if i == t.focusIndex {
 			tv.SetBorderColor(tcell.ColorYellow)
 			t.app.SetFocus(tv)
@@ -420,15 +549,15 @@ func formatPaneTitle(name string, running bool, status string) string {
 	var color string
 
 	if !running {
-		indicator = "✗"
+		indicator = "x"
 		color = "red"
 	} else {
 		switch status {
 		case "Healthy":
-			indicator = "✓"
+			indicator = "o"
 			color = "green"
 		case "Checking":
-			indicator = "◐"
+			indicator = "~"
 			color = "yellow"
 		case "Unhealthy":
 			indicator = "!"

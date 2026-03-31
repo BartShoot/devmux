@@ -1,18 +1,18 @@
 package tui
 
 import (
-	"encoding/json"
+	"fmt"
 	"net"
 	"sync"
 
 	"devmux/internal/protocol"
 )
 
-// StreamClient manages the streaming connection to the daemon
+// StreamClient manages the binary streaming connection to the daemon
 type StreamClient struct {
 	conn     net.Conn
-	encoder  *json.Encoder
-	decoder  *json.Decoder
+	writer   *protocol.BinaryWriter
+	reader   *protocol.BinaryReader
 	handlers StreamHandlers
 	mu       sync.Mutex
 	closed   bool
@@ -27,17 +27,23 @@ type StreamHandlers struct {
 	OnError        func(*protocol.ErrorMsg)
 }
 
-// NewStreamClient creates a new streaming client
+// NewStreamClient creates a new binary streaming client
 func NewStreamClient(network, addr string, handlers StreamHandlers) (*StreamClient, error) {
 	conn, err := net.Dial(network, addr)
 	if err != nil {
 		return nil, err
 	}
 
+	// Send binary protocol magic handshake
+	if _, err := conn.Write(protocol.BinaryMagic[:]); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to send protocol magic: %w", err)
+	}
+
 	return &StreamClient{
 		conn:     conn,
-		encoder:  json.NewEncoder(conn),
-		decoder:  json.NewDecoder(conn),
+		writer:   protocol.NewBinaryWriter(conn),
+		reader:   protocol.NewBinaryReader(conn),
 		handlers: handlers,
 	}, nil
 }
@@ -50,12 +56,12 @@ func (c *StreamClient) Close() error {
 	return c.conn.Close()
 }
 
-// ReceiveLoop reads messages from the server and dispatches to handlers
-// This should be run in a goroutine
+// ReceiveLoop reads binary messages from the server and dispatches to handlers.
+// This should be run in a goroutine.
 func (c *StreamClient) ReceiveLoop() error {
 	for {
-		var msg protocol.ServerMessage
-		if err := c.decoder.Decode(&msg); err != nil {
+		msg, err := c.reader.ReadServerMessage()
+		if err != nil {
 			c.mu.Lock()
 			closed := c.closed
 			c.mu.Unlock()
@@ -94,14 +100,14 @@ func (c *StreamClient) ReceiveLoop() error {
 func (c *StreamClient) SendGetLayout() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.encoder.Encode(protocol.ClientMessage{Type: protocol.MsgGetLayout})
+	return c.writer.WriteClientMessage(&protocol.ClientMessage{Type: protocol.MsgGetLayout})
 }
 
 // SendSubscribe subscribes to pane updates
 func (c *StreamClient) SendSubscribe(paneIDs []protocol.PaneID) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.encoder.Encode(protocol.ClientMessage{
+	return c.writer.WriteClientMessage(&protocol.ClientMessage{
 		Type:      protocol.MsgSubscribe,
 		Subscribe: &protocol.SubscribeMsg{PaneIDs: paneIDs},
 	})
@@ -111,7 +117,7 @@ func (c *StreamClient) SendSubscribe(paneIDs []protocol.PaneID) error {
 func (c *StreamClient) SendUnsubscribe(paneIDs []protocol.PaneID) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.encoder.Encode(protocol.ClientMessage{
+	return c.writer.WriteClientMessage(&protocol.ClientMessage{
 		Type:      protocol.MsgUnsubscribe,
 		Subscribe: &protocol.SubscribeMsg{PaneIDs: paneIDs},
 	})
@@ -121,7 +127,7 @@ func (c *StreamClient) SendUnsubscribe(paneIDs []protocol.PaneID) error {
 func (c *StreamClient) SendInput(paneID protocol.PaneID, data string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.encoder.Encode(protocol.ClientMessage{
+	return c.writer.WriteClientMessage(&protocol.ClientMessage{
 		Type:  protocol.MsgInput,
 		Input: &protocol.InputMsg{PaneID: paneID, Data: data},
 	})
@@ -131,7 +137,7 @@ func (c *StreamClient) SendInput(paneID protocol.PaneID, data string) error {
 func (c *StreamClient) SendMouse(paneID protocol.PaneID, action protocol.MouseAction, x, y int) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.encoder.Encode(protocol.ClientMessage{
+	return c.writer.WriteClientMessage(&protocol.ClientMessage{
 		Type: protocol.MsgMouse,
 		Mouse: &protocol.MouseMsg{
 			PaneID: paneID,
@@ -146,7 +152,7 @@ func (c *StreamClient) SendMouse(paneID protocol.PaneID, action protocol.MouseAc
 func (c *StreamClient) SendResize(paneID protocol.PaneID, cols, rows int) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.encoder.Encode(protocol.ClientMessage{
+	return c.writer.WriteClientMessage(&protocol.ClientMessage{
 		Type: protocol.MsgResize,
 		Resize: &protocol.ResizeMsg{
 			PaneID: paneID,

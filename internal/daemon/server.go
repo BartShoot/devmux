@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -129,41 +130,39 @@ func (s *Server) Start() error {
 	}
 }
 
-// rawMessage is used for protocol detection
-type rawMessage struct {
-	Type    json.RawMessage `json:"type,omitempty"`
-	Command string          `json:"command,omitempty"`
-}
-
 func (s *Server) handleConnection(conn net.Conn) {
-	decoder := json.NewDecoder(conn)
-	encoder := json.NewEncoder(conn)
-
-	// Read first message to detect protocol
-	var raw json.RawMessage
-	if err := decoder.Decode(&raw); err != nil {
-		json.NewEncoder(conn).Encode(protocol.Response{Status: "error", Message: "invalid request"})
+	// Peek at first byte to detect protocol:
+	// Binary streaming starts with 'D' (from magic "DMX\x01")
+	// Legacy JSON starts with '{' (0x7B)
+	br := bufio.NewReader(conn)
+	firstByte, err := br.Peek(1)
+	if err != nil {
 		conn.Close()
 		return
 	}
 
-	// Detect protocol by checking which fields exist
-	var msg rawMessage
-	json.Unmarshal(raw, &msg)
-
-	if msg.Type != nil && len(msg.Type) > 0 {
-		// New streaming protocol - decode as ClientMessage
-		var clientMsg protocol.ClientMessage
-		if err := json.Unmarshal(raw, &clientMsg); err != nil {
-			encoder.Encode(protocol.Response{Status: "error", Message: "invalid streaming message"})
+	if firstByte[0] == protocol.BinaryMagic[0] {
+		// Binary streaming protocol — read and validate full magic
+		var magic [4]byte
+		if _, err := br.Read(magic[:]); err != nil || magic != protocol.BinaryMagic {
 			conn.Close()
 			return
 		}
-		s.handleStreamingConnectionWithFirst(conn, decoder, encoder, &clientMsg)
+		s.handleBinaryStreamingConnection(conn, br)
 		return
 	}
 
-	// Legacy protocol - decode as Request
+	// Legacy JSON protocol
+	decoder := json.NewDecoder(br)
+	encoder := json.NewEncoder(conn)
+
+	var raw json.RawMessage
+	if err := decoder.Decode(&raw); err != nil {
+		encoder.Encode(protocol.Response{Status: "error", Message: "invalid request"})
+		conn.Close()
+		return
+	}
+
 	var req protocol.Request
 	if err := json.Unmarshal(raw, &req); err != nil {
 		encoder.Encode(protocol.Response{Status: "error", Message: "invalid request"})
@@ -171,21 +170,15 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// Legacy protocol handling
 	defer conn.Close()
 	s.handleLegacyRequest(conn, encoder, &req)
 }
 
-// handleStreamingConnectionWithFirst handles a streaming connection with the first message already decoded
-func (s *Server) handleStreamingConnectionWithFirst(conn net.Conn, decoder *json.Decoder, encoder *json.Encoder, firstMsg *protocol.ClientMessage) {
+// handleBinaryStreamingConnection sets up a binary streaming client after magic is consumed
+func (s *Server) handleBinaryStreamingConnection(conn net.Conn, br *bufio.Reader) {
 	client := s.clientManager.AddClient(conn, s)
-	client.encoder = encoder
-	client.decoder = decoder
-
-	// Handle the first message
-	client.handleMessage(firstMsg)
-
-	// Continue with normal read loop
+	// Override the reader to use the buffered reader (which already consumed the magic)
+	client.reader = protocol.NewBinaryReader(br)
 	client.Run()
 }
 
@@ -445,9 +438,77 @@ func (s *Server) sendFullScreenUpdate(client *StreamingClient, paneID protocol.P
 	})
 }
 
-// NotifyScreenUpdate queues a screen update for subscribers (called from process pump)
-func (s *Server) NotifyScreenUpdate(paneID protocol.PaneID, update *protocol.ScreenUpdate) {
-	s.coalescer.QueueUpdate(update)
+// materializeScreenUpdate reads terminal state for a pane and builds a ScreenUpdate.
+// Called only from coalescer flush — not on every stdout read.
+func (s *Server) materializeScreenUpdate(paneID protocol.PaneID) *protocol.ScreenUpdate {
+	name := s.getPaneName(paneID)
+	if name == "" {
+		return nil
+	}
+
+	s.pm.mu.Lock()
+	proc, exists := s.pm.processes[name]
+	s.pm.mu.Unlock()
+
+	if !exists || proc.Terminal == nil {
+		return nil
+	}
+
+	screen := proc.Terminal.GetScreen()
+	cursor := proc.Terminal.GetCursor()
+	cols, rows := proc.Terminal.Size()
+
+	cells := make([]protocol.CellData, 0, cols*rows)
+	for _, row := range screen {
+		for _, cell := range row {
+			var attrs uint8
+			if cell.Bold {
+				attrs |= protocol.AttrBold
+			}
+			if cell.Italic {
+				attrs |= protocol.AttrItalic
+			}
+			if cell.Underline {
+				attrs |= protocol.AttrUnderline
+			}
+			if cell.Strikethrough {
+				attrs |= protocol.AttrStrikethrough
+			}
+
+			cells = append(cells, protocol.CellData{
+				Char: cell.Char,
+				FG: protocol.Color{
+					R:       cell.FG.R,
+					G:       cell.FG.G,
+					B:       cell.FG.B,
+					Default: cell.FG.Default,
+				},
+				BG: protocol.Color{
+					R:       cell.BG.R,
+					G:       cell.BG.G,
+					B:       cell.BG.B,
+					Default: cell.BG.Default,
+				},
+				Attrs: attrs,
+			})
+		}
+	}
+
+	seq := atomic.AddUint64(&proc.updateSeq, 1)
+
+	return &protocol.ScreenUpdate{
+		PaneID:   paneID,
+		Sequence: seq,
+		Full:     true,
+		Cols:     uint16(cols),
+		Rows:     uint16(rows),
+		Cells:    cells,
+		Cursor: protocol.CursorData{
+			X:       uint16(cursor.X),
+			Y:       uint16(cursor.Y),
+			Visible: cursor.Visible,
+		},
+	}
 }
 
 // BroadcastPaneStatus sends a pane status update to all subscribers
