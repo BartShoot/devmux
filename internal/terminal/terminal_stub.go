@@ -135,6 +135,14 @@ func (t *Terminal) scrollUp() {
 	}
 }
 
+// ScrollViewport is a no-op in the stub (no scrollback).
+func (t *Terminal) ScrollViewport(action uint8, amount int) {}
+
+// GetScrollbar returns zeros in the stub (no scrollback).
+func (t *Terminal) GetScrollbar() (total, offset, length uint64) {
+	return 0, 0, 0
+}
+
 // Resize changes the terminal dimensions
 func (t *Terminal) Resize(cols, rows int) {
 	t.mu.Lock()

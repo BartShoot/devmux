@@ -73,19 +73,10 @@ func TestProcessManager_RestartProcess(t *testing.T) {
 		t.Error("Restart should have created a new ManagedProcess instance")
 	}
 
-	// Check if restart message was added to buffer
-	lines := newP.Buffer.GetLines()
-	found := false
-	for _, line := range lines {
-		if line != "" && (line == "--- RESTARTING restart-proc ---" || len(line) > 20) { // accounting for the yellow tags we added
-			found = true
-			break
-		}
+	if !newP.Running {
+		t.Error("Restarted process should be running")
 	}
-	if !found {
-		t.Error("Restart message not found in buffer")
-	}
-	
+
 	// Cleanup
 	pm.StopAll()
 }

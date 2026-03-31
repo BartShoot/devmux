@@ -99,34 +99,47 @@ type ManagedProcess struct {
 	updateSeq     uint64             // Sequence number for screen updates
 }
 
-func (pm *ProcessManager) RestartProcess(name string) error {
+// StopProcess stops a running process by name.
+func (pm *ProcessManager) StopProcess(name string) error {
 	pm.mu.Lock()
 	p, exists := pm.processes[name]
-	running := exists && p.Running
 	pm.mu.Unlock()
 
 	if !exists {
 		return fmt.Errorf("process %s not found", name)
 	}
-
-	if running {
-		fmt.Printf("Restarting %s: Killing process tree...\n", name)
-		pm.killProcessTree(p)
-
-		// Wait for it to be cleaned up by the goroutine
-		for i := 0; i < 20; i++ {
-			pm.mu.Lock()
-			running := p.Running
-			pm.mu.Unlock()
-			if !running {
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
+	if !p.Running {
+		return nil // already stopped
 	}
 
-	// Capture config before deleting
+	fmt.Printf("Stopping %s...\n", name)
+	pm.killProcessTree(p)
+
+	// Wait for cleanup goroutine to mark as not running
+	for i := 0; i < 20; i++ {
+		pm.mu.Lock()
+		running := p.Running
+		pm.mu.Unlock()
+		if !running {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return nil
+}
+
+// StartStopped restarts a stopped process using its stored config.
+func (pm *ProcessManager) StartStopped(name string) error {
 	pm.mu.Lock()
+	p, exists := pm.processes[name]
+	if !exists {
+		pm.mu.Unlock()
+		return fmt.Errorf("process %s not found", name)
+	}
+	if p.Running {
+		pm.mu.Unlock()
+		return fmt.Errorf("process %s is already running", name)
+	}
 	command := p.Command
 	cwd := p.Cwd
 	hcCfg := p.HCCfg
@@ -134,13 +147,26 @@ func (pm *ProcessManager) RestartProcess(name string) error {
 	delete(pm.processes, name)
 	pm.mu.Unlock()
 
-	// Clear the buffer and add a restart message
 	buffer.Clear()
-	buffer.Write([]byte(fmt.Sprintf("\n[yellow]----------------------------------------[-]\n")))
-	buffer.Write([]byte(fmt.Sprintf("[yellow]  RESTARTING %s [-]\n", name)))
-	buffer.Write([]byte(fmt.Sprintf("[yellow]----------------------------------------[-]\n\n")))
-
 	return pm.StartProcessWithBuffer(name, command, cwd, hcCfg, buffer)
+}
+
+func (pm *ProcessManager) RestartProcess(name string) error {
+	pm.mu.Lock()
+	p, exists := pm.processes[name]
+	pm.mu.Unlock()
+
+	if !exists {
+		return fmt.Errorf("process %s not found", name)
+	}
+
+	if p.Running {
+		if err := pm.StopProcess(name); err != nil {
+			return err
+		}
+	}
+
+	return pm.StartStopped(name)
 }
 
 func (pm *ProcessManager) StartProcessWithBuffer(name, command, cwd string, hcCfg config.HealthCheck, buffer *LogBuffer) error {

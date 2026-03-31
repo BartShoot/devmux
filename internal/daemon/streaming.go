@@ -218,6 +218,14 @@ func (c *StreamingClient) handleMessage(msg *protocol.ClientMessage) {
 		if msg.Resize != nil {
 			c.handleResize(msg.Resize)
 		}
+	case protocol.MsgScroll:
+		if msg.Scroll != nil {
+			c.handleScroll(msg.Scroll)
+		}
+	case protocol.MsgProcessControl:
+		if msg.ProcessControl != nil {
+			c.handleProcessControl(msg.ProcessControl)
+		}
 	}
 }
 
@@ -321,6 +329,63 @@ func (c *StreamingClient) handleResize(msg *protocol.ResizeMsg) {
 
 	// Send immediate screen update with new dimensions
 	c.server.sendFullScreenUpdate(c, msg.PaneID)
+}
+
+func (c *StreamingClient) handleScroll(msg *protocol.ScrollMsg) {
+	name := c.server.getPaneName(msg.PaneID)
+	if name == "" {
+		return
+	}
+
+	c.server.pm.mu.Lock()
+	proc, exists := c.server.pm.processes[name]
+	c.server.pm.mu.Unlock()
+
+	if !exists || proc.Terminal == nil {
+		return
+	}
+
+	proc.Terminal.ScrollViewport(uint8(msg.Action), int(msg.Amount))
+
+	// Send the new viewport content
+	c.server.sendFullScreenUpdate(c, msg.PaneID)
+}
+
+func (c *StreamingClient) handleProcessControl(msg *protocol.ProcessControlMsg) {
+	name := c.server.getPaneName(msg.PaneID)
+	if name == "" {
+		return
+	}
+
+	var err error
+	switch msg.Action {
+	case protocol.ProcessStop:
+		err = c.server.pm.StopProcess(name)
+	case protocol.ProcessStart:
+		err = c.server.pm.StartStopped(name)
+	case protocol.ProcessRestart:
+		err = c.server.pm.RestartProcess(name)
+	}
+
+	if err != nil {
+		c.Send(&protocol.ServerMessage{
+			Type:  protocol.MsgError,
+			Error: &protocol.ErrorMsg{Message: err.Error()},
+		})
+		return
+	}
+
+	// Broadcast updated status
+	c.server.pm.mu.Lock()
+	proc, exists := c.server.pm.processes[name]
+	running := exists && proc.Running
+	status := ""
+	if exists {
+		status = string(proc.Status)
+	}
+	c.server.pm.mu.Unlock()
+
+	c.server.BroadcastPaneStatus(msg.PaneID, running, status)
 }
 
 // setTerminalSize resizes a PTY to the given dimensions

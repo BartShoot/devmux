@@ -52,7 +52,9 @@ const (
 	MsgUnsubscribe ClientMsgType = 3
 	MsgInput      ClientMsgType = 4
 	MsgMouse      ClientMsgType = 5
-	MsgResize     ClientMsgType = 6
+	MsgResize          ClientMsgType = 6
+	MsgScroll          ClientMsgType = 7
+	MsgProcessControl  ClientMsgType = 8
 )
 
 // Daemon -> Client message types
@@ -68,11 +70,13 @@ const (
 
 // ClientMessage is the envelope for all client-to-daemon messages
 type ClientMessage struct {
-	Type       ClientMsgType   `json:"type"`
-	Subscribe  *SubscribeMsg   `json:"subscribe,omitempty"`
-	Input      *InputMsg       `json:"input,omitempty"`
-	Mouse      *MouseMsg       `json:"mouse,omitempty"`
-	Resize     *ResizeMsg      `json:"resize,omitempty"`
+	Type           ClientMsgType      `json:"type"`
+	Subscribe      *SubscribeMsg      `json:"subscribe,omitempty"`
+	Input          *InputMsg          `json:"input,omitempty"`
+	Mouse          *MouseMsg          `json:"mouse,omitempty"`
+	Resize         *ResizeMsg         `json:"resize,omitempty"`
+	Scroll         *ScrollMsg         `json:"scroll,omitempty"`
+	ProcessControl *ProcessControlMsg `json:"process_control,omitempty"`
 }
 
 // ServerMessage is the envelope for all daemon-to-client messages
@@ -120,6 +124,45 @@ type ResizeMsg struct {
 	Rows   uint16 `json:"rows"`
 }
 
+// ScrollAction represents viewport scroll operations
+type ScrollAction uint8
+
+const (
+	ScrollUp     ScrollAction = 1 // Scroll up by Amount rows
+	ScrollDown   ScrollAction = 2 // Scroll down by Amount rows
+	ScrollTop    ScrollAction = 3 // Scroll to top of scrollback
+	ScrollBottom ScrollAction = 4 // Scroll to bottom (resume live)
+)
+
+// ScrollMsg requests viewport scrolling on a pane
+type ScrollMsg struct {
+	PaneID PaneID       `json:"pane_id"`
+	Action ScrollAction `json:"action"`
+	Amount int16        `json:"amount"` // Row count for Up/Down; ignored for Top/Bottom
+}
+
+// ProcessAction represents process lifecycle operations
+type ProcessAction uint8
+
+const (
+	ProcessStop    ProcessAction = 1
+	ProcessStart   ProcessAction = 2
+	ProcessRestart ProcessAction = 3
+)
+
+// ProcessControlMsg requests a process lifecycle action
+type ProcessControlMsg struct {
+	PaneID PaneID        `json:"pane_id"`
+	Action ProcessAction `json:"action"`
+}
+
+// ScrollInfo describes viewport scroll position (included in ScreenUpdate)
+type ScrollInfo struct {
+	Total  uint64 `json:"total"`  // Total rows including scrollback
+	Offset uint64 `json:"offset"` // Current viewport offset
+	Len    uint64 `json:"len"`    // Visible viewport height
+}
+
 // LayoutMsg contains tab/pane structure with numerical IDs
 type LayoutMsg struct {
 	Tabs []TabInfo `json:"tabs"`
@@ -137,19 +180,21 @@ type TabInfo struct {
 type PaneInfo struct {
 	ID      PaneID `json:"id"`
 	Name    string `json:"name"`
+	Command string `json:"command,omitempty"`
 	Running bool   `json:"running"`
 	Status  string `json:"status"`
 }
 
 // ScreenUpdate contains terminal screen state pushed from daemon
 type ScreenUpdate struct {
-	PaneID   PaneID     `json:"pane_id"`
-	Sequence uint64     `json:"seq"`
-	Full     bool       `json:"full"`
-	Cols     uint16     `json:"cols"`
-	Rows     uint16     `json:"rows"`
-	Cells    []CellData `json:"cells"`
-	Cursor   CursorData `json:"cursor"`
+	PaneID   PaneID      `json:"pane_id"`
+	Sequence uint64      `json:"seq"`
+	Full     bool        `json:"full"`
+	Cols     uint16      `json:"cols"`
+	Rows     uint16      `json:"rows"`
+	Cells    []CellData  `json:"cells"`
+	Cursor   CursorData  `json:"cursor"`
+	Scroll   *ScrollInfo `json:"scroll,omitempty"`
 }
 
 // CellData represents a single terminal cell

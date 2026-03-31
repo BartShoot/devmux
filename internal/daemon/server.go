@@ -343,6 +343,7 @@ func (s *Server) getLayoutMsgWithStatus() *protocol.LayoutMsg {
 				Name: pane.Name,
 			}
 			if p, exists := s.pm.processes[pane.Name]; exists {
+				layout.Tabs[i].Panes[j].Command = p.Command
 				layout.Tabs[i].Panes[j].Running = p.Running
 				layout.Tabs[i].Panes[j].Status = string(p.Status)
 			}
@@ -446,6 +447,14 @@ func (s *Server) forceReadScreenUpdate(paneID protocol.PaneID) *protocol.ScreenU
 	update.Cursor.Y = uint16(cursor.Y)
 	update.Cursor.Visible = cursor.Visible
 
+	// Include scroll position
+	total, offset, length := proc.Terminal.GetScrollbar()
+	update.Scroll = &protocol.ScrollInfo{
+		Total:  total,
+		Offset: offset,
+		Len:    length,
+	}
+
 	return update
 }
 
@@ -485,6 +494,21 @@ func (s *Server) materializeScreenUpdate(paneID protocol.PaneID) *protocol.Scree
 	// FillScreen returns false if nothing changed (dirty tracking)
 	var cursor terminal.CursorState
 	if !proc.Terminal.FillScreen(cellBuf, &cursor) {
+		// Viewport content unchanged, but if scrolled up, send a scroll-info-only
+		// update so the TUI can show updated line counts as new output arrives.
+		total, offset, length := proc.Terminal.GetScrollbar()
+		if total > 0 && offset+length < total {
+			// Scrolled up — send lightweight update with just scroll info
+			update := s.paneCellBufs[paneID]
+			if update != nil && len(update.Cells) > 0 {
+				seq := atomic.AddUint64(&proc.updateSeq, 1)
+				update.Sequence = seq
+				update.Scroll = &protocol.ScrollInfo{
+					Total: total, Offset: offset, Len: length,
+				}
+				return update
+			}
+		}
 		return nil
 	}
 
@@ -537,6 +561,14 @@ func (s *Server) materializeScreenUpdate(paneID protocol.PaneID) *protocol.Scree
 	update.Cursor.X = uint16(cursor.X)
 	update.Cursor.Y = uint16(cursor.Y)
 	update.Cursor.Visible = cursor.Visible
+
+	// Include scroll position
+	total, offset, length := proc.Terminal.GetScrollbar()
+	update.Scroll = &protocol.ScrollInfo{
+		Total:  total,
+		Offset: offset,
+		Len:    length,
+	}
 
 	return update
 }

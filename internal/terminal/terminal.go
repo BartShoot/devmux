@@ -10,6 +10,16 @@ package terminal
 #include <stdint.h>
 #include <stdbool.h>
 #include <ghostty/vt.h>
+
+// C-side helper to construct GhosttyTerminalOptions with correct layout.
+// Avoids CGO struct padding mismatches.
+static inline GhosttyTerminalOptions make_terminal_opts(uint16_t cols, uint16_t rows, size_t max_scrollback) {
+	GhosttyTerminalOptions opts = {0};
+	opts.cols = cols;
+	opts.rows = rows;
+	opts.max_scrollback = max_scrollback;
+	return opts;
+}
 */
 import "C"
 import (
@@ -17,6 +27,11 @@ import (
 	"sync"
 	"unsafe"
 )
+
+// MaxScrollbackBytes is the scrollback buffer size in bytes (not lines).
+// Ghostty's page list allocator uses ~1KB per 80-col line, so 10MB ≈ 10,000 lines.
+// Increase for more scrollback at the cost of memory per pane.
+const MaxScrollbackBytes = 10 * 1024 * 1024 // 10MB
 
 // Terminal represents a virtual terminal backed by libghostty
 type Terminal struct {
@@ -70,17 +85,14 @@ func New(cols, rows int) (*Terminal, error) {
 		rows: rows,
 	}
 
-	opts := C.GhosttyTerminalOptions{
-		cols:           C.uint16_t(cols),
-		rows:           C.uint16_t(rows),
-		max_scrollback: 10000,
-	}
+	opts := C.make_terminal_opts(C.uint16_t(cols), C.uint16_t(rows), C.size_t(MaxScrollbackBytes))
 
 	var err C.GhosttyResult
 	err = C.ghostty_terminal_new(nil, &t.term, opts)
 	if err != C.GHOSTTY_SUCCESS {
 		return nil, fmt.Errorf("failed to create terminal: error code %d", err)
 	}
+
 
 	err = C.ghostty_render_state_new(nil, &t.renderState)
 	if err != C.GHOSTTY_SUCCESS {
@@ -150,6 +162,42 @@ func (t *Terminal) Resize(cols, rows int) {
 	t.cols = cols
 	t.rows = rows
 	C.ghostty_terminal_resize(t.term, C.uint16_t(cols), C.uint16_t(rows), 8, 16)
+}
+
+// ScrollViewport scrolls the terminal viewport.
+// action: 1=up, 2=down, 3=top, 4=bottom. amount is row count for up/down.
+func (t *Terminal) ScrollViewport(action uint8, amount int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var behavior C.GhosttyTerminalScrollViewport
+	switch action {
+	case 1: // up
+		behavior.tag = C.GHOSTTY_SCROLL_VIEWPORT_DELTA
+		// CGO represents the C union as an opaque byte array.
+		// Write intptr_t delta into the first bytes of the union.
+		*(*C.intptr_t)(unsafe.Pointer(&behavior.value[0])) = C.intptr_t(-amount)
+	case 2: // down
+		behavior.tag = C.GHOSTTY_SCROLL_VIEWPORT_DELTA
+		*(*C.intptr_t)(unsafe.Pointer(&behavior.value[0])) = C.intptr_t(amount)
+	case 3: // top
+		behavior.tag = C.GHOSTTY_SCROLL_VIEWPORT_TOP
+	case 4: // bottom
+		behavior.tag = C.GHOSTTY_SCROLL_VIEWPORT_BOTTOM
+	default:
+		return
+	}
+	C.ghostty_terminal_scroll_viewport(t.term, behavior)
+}
+
+// GetScrollbar returns the scrollbar state (total rows, viewport offset, viewport length).
+func (t *Terminal) GetScrollbar() (total, offset, length uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var sb C.GhosttyTerminalScrollbar
+	C.ghostty_terminal_get(t.term, C.GHOSTTY_TERMINAL_DATA_SCROLLBAR, unsafe.Pointer(&sb))
+	return uint64(sb.total), uint64(sb.offset), uint64(sb.len)
 }
 
 // GetCursor returns the current cursor state

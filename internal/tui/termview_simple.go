@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"sync"
 
 	"devmux/internal/protocol"
@@ -15,13 +16,16 @@ type SimpleTerminalView struct {
 	*tview.Box
 	paneID    protocol.PaneID
 	name      string
+	command   string // process command (for display in overlay)
 	cells     []protocol.CellData
 	cols      int // terminal cols from daemon
 	rows      int // terminal rows from daemon
 	viewCols  int // last sent view width
 	viewRows  int // last sent view height
 	cursor    protocol.CursorData
+	scroll    *protocol.ScrollInfo
 	selection *protocol.SelectionMsg
+	running   bool
 	focused   bool
 	mu        sync.RWMutex
 }
@@ -29,11 +33,12 @@ type SimpleTerminalView struct {
 // NewSimpleTerminalView creates a new simple terminal view
 func NewSimpleTerminalView(paneID protocol.PaneID, name string) *SimpleTerminalView {
 	tv := &SimpleTerminalView{
-		Box:    tview.NewBox(),
-		paneID: paneID,
-		name:   name,
-		cols:   80,
-		rows:   24,
+		Box:     tview.NewBox(),
+		paneID:  paneID,
+		name:    name,
+		cols:    80,
+		rows:    24,
+		running: true,
 	}
 	tv.SetBorder(true)
 	tv.SetBackgroundColor(colBase)
@@ -57,6 +62,7 @@ func (tv *SimpleTerminalView) UpdateScreen(update *protocol.ScreenUpdate) {
 	tv.rows = int(update.Rows)
 	tv.cells = update.Cells
 	tv.cursor = update.Cursor
+	tv.scroll = update.Scroll
 }
 
 // UpdateSelection updates the selection state
@@ -141,14 +147,50 @@ func (tv *SimpleTerminalView) Draw(screen tcell.Screen) {
 		cursorY := y + int(tv.cursor.Y)
 
 		if cursorX >= x && cursorX < x+width && cursorY >= y && cursorY < y+height {
-			// Get current cell content at cursor position
 			mainc, combc, style, _ := screen.GetContent(cursorX, cursorY)
-
-			// Invert colors for cursor
 			fg, bg, attrs := style.Decompose()
 			cursorStyle := style.Foreground(bg).Background(fg).Attributes(attrs)
-
 			screen.SetContent(cursorX, cursorY, mainc, combc, cursorStyle)
+		}
+	}
+
+	// Scroll indicator (top-right corner when scrolled up)
+	if tv.scroll != nil && tv.scroll.Offset+tv.scroll.Len < tv.scroll.Total {
+		linesAbove := tv.scroll.Total - tv.scroll.Offset - tv.scroll.Len
+		indicator := fmt.Sprintf(" +%d lines ", linesAbove)
+		indicatorStyle := tcell.StyleDefault.Background(colSurface0).Foreground(colYellow)
+		startCol := width - len(indicator)
+		if startCol < 0 {
+			startCol = 0
+		}
+		for i, ch := range indicator {
+			if startCol+i < width {
+				screen.SetContent(x+startCol+i, y, ch, nil, indicatorStyle)
+			}
+		}
+	}
+
+	// Stopped overlay (bottom of pane when process not running)
+	if !tv.running {
+		overlayY := y + height - 1
+		cmd := tv.command
+		if len(cmd) > width-30 {
+			cmd = cmd[:width-30] + "..."
+		}
+		overlayText := fmt.Sprintf(" [Stopped] %s  -- Enter to restart ", cmd)
+		if len(overlayText) > width {
+			overlayText = overlayText[:width]
+		}
+		overlayStyle := tcell.StyleDefault.Background(colRed).Foreground(colBase)
+		startCol := 0
+		for i, ch := range overlayText {
+			if startCol+i < width {
+				screen.SetContent(x+startCol+i, overlayY, ch, nil, overlayStyle)
+			}
+		}
+		// Fill rest of overlay line
+		for i := len([]rune(overlayText)); i < width; i++ {
+			screen.SetContent(x+i, overlayY, ' ', nil, overlayStyle)
 		}
 	}
 }

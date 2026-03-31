@@ -196,6 +196,8 @@ func (t *StreamingTUI) buildTabContent(tab protocol.TabInfo, tabViews *[]*Simple
 	// Create views for each pane
 	for _, pane := range tab.Panes {
 		tv := NewSimpleTerminalView(pane.ID, pane.Name)
+		tv.command = pane.Command
+		tv.running = pane.Running
 		title := formatPaneTitle(pane.Name, pane.Running, pane.Status)
 		tv.SetTitle(title)
 		*tabViews = append(*tabViews, tv)
@@ -289,6 +291,10 @@ func (t *StreamingTUI) handlePaneStatus(status *protocol.PaneStatusMsg) {
 	t.mu.Unlock()
 
 	if ok {
+		tv.mu.Lock()
+		tv.running = status.Running
+		tv.mu.Unlock()
+
 		t.app.QueueUpdateDraw(func() {
 			title := formatPaneTitle(tv.name, status.Running, status.Status)
 			tv.SetTitle(title)
@@ -311,12 +317,6 @@ func (t *StreamingTUI) currentTabPanes() []*SimpleTerminalView {
 
 // handleInput processes keyboard input based on current mode
 func (t *StreamingTUI) handleInput(event *tcell.EventKey) *tcell.EventKey {
-	// Ctrl+C always quits regardless of mode
-	if event.Key() == tcell.KeyCtrlC {
-		t.app.Stop()
-		return nil
-	}
-
 	t.mu.Lock()
 	mode := t.mode
 	t.mu.Unlock()
@@ -344,6 +344,56 @@ func (t *StreamingTUI) handleNormalMode(event *tcell.EventKey) *tcell.EventKey {
 		t.mode = ModeInsert
 		t.mu.Unlock()
 		t.updateStatusBar()
+		return nil
+
+	// Process control
+	case event.Key() == tcell.KeyCtrlC:
+		t.processControlFocused(protocol.ProcessStop)
+		return nil
+
+	case event.Key() == tcell.KeyEnter:
+		// Only start if process is stopped
+		t.mu.Lock()
+		panes := t.currentTabPanes()
+		var stopped bool
+		if t.focusIndex < len(panes) {
+			panes[t.focusIndex].mu.RLock()
+			stopped = !panes[t.focusIndex].running
+			panes[t.focusIndex].mu.RUnlock()
+		}
+		t.mu.Unlock()
+		if stopped {
+			t.processControlFocused(protocol.ProcessStart)
+		}
+		return nil
+
+	case event.Key() == tcell.KeyCtrlR:
+		t.processControlFocused(protocol.ProcessRestart)
+		return nil
+
+	// Scrolling
+	case event.Key() == tcell.KeyCtrlU:
+		t.scrollFocused(protocol.ScrollUp, int16(t.focusedPaneHeight()/2))
+		return nil
+
+	case event.Key() == tcell.KeyCtrlD:
+		t.scrollFocused(protocol.ScrollDown, int16(t.focusedPaneHeight()/2))
+		return nil
+
+	case event.Key() == tcell.KeyCtrlB:
+		t.scrollFocused(protocol.ScrollUp, int16(t.focusedPaneHeight()))
+		return nil
+
+	case event.Key() == tcell.KeyCtrlF:
+		t.scrollFocused(protocol.ScrollDown, int16(t.focusedPaneHeight()))
+		return nil
+
+	case event.Rune() == 'G':
+		t.scrollFocused(protocol.ScrollTop, 0)
+		return nil
+
+	case event.Rune() == 'g':
+		t.scrollFocused(protocol.ScrollBottom, 0)
 		return nil
 
 	// Pane navigation (within current tab)
@@ -406,6 +456,48 @@ func (t *StreamingTUI) handleNormalMode(event *tcell.EventKey) *tcell.EventKey {
 	return event
 }
 
+// scrollFocused sends a scroll command for the focused pane
+func (t *StreamingTUI) scrollFocused(action protocol.ScrollAction, amount int16) {
+	t.mu.Lock()
+	panes := t.currentTabPanes()
+	var paneID protocol.PaneID
+	if t.focusIndex < len(panes) {
+		paneID = panes[t.focusIndex].PaneID()
+	}
+	t.mu.Unlock()
+	if paneID != 0 {
+		go t.client.SendScroll(paneID, action, amount)
+	}
+}
+
+// focusedPaneHeight returns the inner height of the focused pane
+func (t *StreamingTUI) focusedPaneHeight() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	panes := t.currentTabPanes()
+	if t.focusIndex < len(panes) {
+		_, h := panes[t.focusIndex].GetInnerSize()
+		if h > 0 {
+			return h
+		}
+	}
+	return 24
+}
+
+// processControlFocused sends a process control command for the focused pane
+func (t *StreamingTUI) processControlFocused(action protocol.ProcessAction) {
+	t.mu.Lock()
+	panes := t.currentTabPanes()
+	var paneID protocol.PaneID
+	if t.focusIndex < len(panes) {
+		paneID = panes[t.focusIndex].PaneID()
+	}
+	t.mu.Unlock()
+	if paneID != 0 {
+		go t.client.SendProcessControl(paneID, action)
+	}
+}
+
 // handleInsertMode captures all input and forwards to the focused pane
 func (t *StreamingTUI) handleInsertMode(event *tcell.EventKey) *tcell.EventKey {
 	// Escape returns to normal mode
@@ -438,8 +530,12 @@ func (t *StreamingTUI) handleInsertMode(event *tcell.EventKey) *tcell.EventKey {
 		input = "\x7f"
 	case tcell.KeyTab:
 		input = "\t"
+	case tcell.KeyCtrlC:
+		input = "\x03"
 	case tcell.KeyCtrlD:
 		input = "\x04"
+	case tcell.KeyCtrlR:
+		input = "\x12"
 	case tcell.KeyCtrlA:
 		input = "\x01"
 	case tcell.KeyCtrlE:
@@ -540,9 +636,9 @@ func (t *StreamingTUI) updateStatusBar() {
 
 	switch mode {
 	case ModeNormal:
-		t.statusBar.SetText("[#1e1e2e:#89b4fa] -- NORMAL -- [-:-]  [#6c7086]hjkl:focus  1-9:tab  i:insert  q:quit[-]")
+		t.statusBar.SetText("[#1e1e2e:#89b4fa] -- NORMAL -- [-:-]  [#6c7086]hjkl:focus  1-9:tab  i:insert  ^U/^D:scroll  ^C:stop  Enter:start  ^R:restart  q:quit[-]")
 	case ModeInsert:
-		t.statusBar.SetText("[#1e1e2e:#a6e3a1] -- INSERT -- [-:-]  [#6c7086]Esc:normal[-]")
+		t.statusBar.SetText("[#1e1e2e:#a6e3a1] -- INSERT -- [-:-]  [#6c7086]Esc:normal  (all input forwarded to process)[-]")
 	}
 }
 

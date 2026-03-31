@@ -99,6 +99,10 @@ func (bw *BinaryWriter) WriteClientMessage(msg *ClientMessage) error {
 		bw.encodeMouse(msg.Mouse)
 	case MsgResize:
 		bw.encodeResize(msg.Resize)
+	case MsgScroll:
+		bw.encodeScroll(msg.Scroll)
+	case MsgProcessControl:
+		bw.encodeProcessControl(msg.ProcessControl)
 	default:
 		return fmt.Errorf("unknown client message type: %d", msg.Type)
 	}
@@ -198,6 +202,10 @@ func (br *BinaryReader) ReadClientMessage() (*ClientMessage, error) {
 		msg.Mouse, err = decodeMouse(data)
 	case MsgResize:
 		msg.Resize, err = decodeResize(data)
+	case MsgScroll:
+		msg.Scroll, err = decodeScroll(data)
+	case MsgProcessControl:
+		msg.ProcessControl, err = decodeProcessControl(data)
 	default:
 		return nil, fmt.Errorf("unknown client message type: %d", msg.Type)
 	}
@@ -269,12 +277,20 @@ func (bw *BinaryWriter) encodeScreenUpdate(u *ScreenUpdate) {
 	if u.Full {
 		flags |= 1
 	}
+	if u.Scroll != nil {
+		flags |= 2
+	}
 	bw.appendU8(flags)
 	bw.appendU16(u.Cols)
 	bw.appendU16(u.Rows)
 	bw.appendU16(u.Cursor.X)
 	bw.appendU16(u.Cursor.Y)
 	bw.appendBool(u.Cursor.Visible)
+	if u.Scroll != nil {
+		bw.appendU64(u.Scroll.Total)
+		bw.appendU64(u.Scroll.Offset)
+		bw.appendU64(u.Scroll.Len)
+	}
 
 	// Sparse cell encoding
 	i := 0
@@ -333,12 +349,29 @@ func DecodeScreenUpdateInto(data []byte, reuse *ScreenUpdate) (*ScreenUpdate, er
 
 	u.PaneID = PaneID(binary.BigEndian.Uint32(data[0:4]))
 	u.Sequence = binary.BigEndian.Uint64(data[4:12])
-	u.Full = data[12]&1 != 0
+	flags := data[12]
+	u.Full = flags&1 != 0
+	hasScroll := flags&2 != 0
 	u.Cols = binary.BigEndian.Uint16(data[13:15])
 	u.Rows = binary.BigEndian.Uint16(data[15:17])
 	u.Cursor.X = binary.BigEndian.Uint16(data[17:19])
 	u.Cursor.Y = binary.BigEndian.Uint16(data[19:21])
 	u.Cursor.Visible = data[21] != 0
+
+	offset := 22
+	if hasScroll {
+		if offset+24 > len(data) {
+			return nil, fmt.Errorf("truncated scroll info")
+		}
+		u.Scroll = &ScrollInfo{
+			Total:  binary.BigEndian.Uint64(data[offset : offset+8]),
+			Offset: binary.BigEndian.Uint64(data[offset+8 : offset+16]),
+			Len:    binary.BigEndian.Uint64(data[offset+16 : offset+24]),
+		}
+		offset += 24
+	} else {
+		u.Scroll = nil
+	}
 
 	// Reuse or allocate cell buffer
 	totalCells := int(u.Cols) * int(u.Rows)
@@ -349,7 +382,6 @@ func DecodeScreenUpdateInto(data []byte, reuse *ScreenUpdate) (*ScreenUpdate, er
 	}
 
 	pos := 0
-	offset := 22
 
 	for offset < len(data) && pos < totalCells {
 		op := data[offset]
@@ -598,6 +630,46 @@ func decodeResize(data []byte) (*ResizeMsg, error) {
 		PaneID: PaneID(r.readU32()),
 		Cols:   r.readU16(),
 		Rows:   r.readU16(),
+	}
+	return m, r.err
+}
+
+// ---------- Scroll encoding ----------
+
+func (bw *BinaryWriter) encodeScroll(m *ScrollMsg) {
+	if m == nil {
+		return
+	}
+	bw.appendU32(uint32(m.PaneID))
+	bw.appendU8(uint8(m.Action))
+	bw.appendU16(uint16(m.Amount))
+}
+
+func decodeScroll(data []byte) (*ScrollMsg, error) {
+	r := &binReader{data: data}
+	m := &ScrollMsg{
+		PaneID: PaneID(r.readU32()),
+		Action: ScrollAction(r.readU8()),
+		Amount: int16(r.readU16()),
+	}
+	return m, r.err
+}
+
+// ---------- ProcessControl encoding ----------
+
+func (bw *BinaryWriter) encodeProcessControl(m *ProcessControlMsg) {
+	if m == nil {
+		return
+	}
+	bw.appendU32(uint32(m.PaneID))
+	bw.appendU8(uint8(m.Action))
+}
+
+func decodeProcessControl(data []byte) (*ProcessControlMsg, error) {
+	r := &binReader{data: data}
+	m := &ProcessControlMsg{
+		PaneID: PaneID(r.readU32()),
+		Action: ProcessAction(r.readU8()),
 	}
 	return m, r.err
 }

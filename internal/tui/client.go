@@ -164,3 +164,30 @@ func (c *StreamClient) SendResize(paneID protocol.PaneID, cols, rows int) error 
 		},
 	})
 }
+
+// SendScroll sends a scroll viewport command
+func (c *StreamClient) SendScroll(paneID protocol.PaneID, action protocol.ScrollAction, amount int16) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.writer.WriteClientMessage(&protocol.ClientMessage{
+		Type: protocol.MsgScroll,
+		Scroll: &protocol.ScrollMsg{
+			PaneID: paneID,
+			Action: action,
+			Amount: amount,
+		},
+	})
+}
+
+// SendProcessControl sends a process lifecycle command
+func (c *StreamClient) SendProcessControl(paneID protocol.PaneID, action protocol.ProcessAction) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.writer.WriteClientMessage(&protocol.ClientMessage{
+		Type: protocol.MsgProcessControl,
+		ProcessControl: &protocol.ProcessControlMsg{
+			PaneID: paneID,
+			Action: action,
+		},
+	})
+}
