@@ -26,6 +26,7 @@ type Terminal struct {
 	rowCells    C.GhosttyRenderStateRowCells
 	cols        int
 	rows        int
+	graphemeBuf [8]C.uint32_t // reusable grapheme buffer (avoids per-cell alloc)
 	mu          sync.Mutex
 }
 
@@ -69,7 +70,6 @@ func New(cols, rows int) (*Terminal, error) {
 		rows: rows,
 	}
 
-	// Create terminal with options
 	opts := C.GhosttyTerminalOptions{
 		cols:           C.uint16_t(cols),
 		rows:           C.uint16_t(rows),
@@ -82,14 +82,12 @@ func New(cols, rows int) (*Terminal, error) {
 		return nil, fmt.Errorf("failed to create terminal: error code %d", err)
 	}
 
-	// Create render state
 	err = C.ghostty_render_state_new(nil, &t.renderState)
 	if err != C.GHOSTTY_SUCCESS {
 		C.ghostty_terminal_free(t.term)
 		return nil, fmt.Errorf("failed to create render state: error code %d", err)
 	}
 
-	// Create row iterator (reusable)
 	err = C.ghostty_render_state_row_iterator_new(nil, &t.rowIter)
 	if err != C.GHOSTTY_SUCCESS {
 		C.ghostty_render_state_free(t.renderState)
@@ -97,7 +95,6 @@ func New(cols, rows int) (*Terminal, error) {
 		return nil, fmt.Errorf("failed to create row iterator: error code %d", err)
 	}
 
-	// Create row cells (reusable)
 	err = C.ghostty_render_state_row_cells_new(nil, &t.rowCells)
 	if err != C.GHOSTTY_SUCCESS {
 		C.ghostty_render_state_row_iterator_free(t.rowIter)
@@ -152,7 +149,6 @@ func (t *Terminal) Resize(cols, rows int) {
 
 	t.cols = cols
 	t.rows = rows
-	// Cell size in pixels (we use 1:1 since we're doing character-based rendering)
 	C.ghostty_terminal_resize(t.term, C.uint16_t(cols), C.uint16_t(rows), 8, 16)
 }
 
@@ -161,7 +157,6 @@ func (t *Terminal) GetCursor() CursorState {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Update render state from terminal
 	C.ghostty_render_state_update(t.renderState, t.term)
 
 	var visible C.bool
@@ -191,12 +186,12 @@ func (t *Terminal) GetCursor() CursorState {
 	}
 }
 
-// GetScreen returns the current screen content as a 2D grid of cells
+// GetScreen returns the current screen content as a 2D grid of cells.
+// Deprecated: use FillScreen for zero-allocation screen reading.
 func (t *Terminal) GetScreen() [][]Cell {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Update render state
 	C.ghostty_render_state_update(t.renderState, t.term)
 
 	screen := make([][]Cell, t.rows)
@@ -211,56 +206,176 @@ func (t *Terminal) GetScreen() [][]Cell {
 		}
 	}
 
-	// Get row iterator from render state
 	C.ghostty_render_state_get(t.renderState, C.GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, unsafe.Pointer(&t.rowIter))
 
 	row := 0
 	for C.ghostty_render_state_row_iterator_next(t.rowIter) && row < t.rows {
-		// Get cells for this row
 		C.ghostty_render_state_row_get(t.rowIter, C.GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, unsafe.Pointer(&t.rowCells))
-
 		col := 0
 		for C.ghostty_render_state_row_cells_next(t.rowCells) && col < t.cols {
-			// Get grapheme length
-			var graphemeLen C.uint32_t
-			C.ghostty_render_state_row_cells_get(t.rowCells, C.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN, unsafe.Pointer(&graphemeLen))
-
-			if graphemeLen > 0 {
-				// Get grapheme codepoints
-				buf := make([]C.uint32_t, graphemeLen)
-				C.ghostty_render_state_row_cells_get(t.rowCells, C.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF, unsafe.Pointer(&buf[0]))
-				screen[row][col].Char = rune(buf[0])
-			}
-
-			// Get foreground color
-			var fgColor C.GhosttyColorRgb
-			fgResult := C.ghostty_render_state_row_cells_get(t.rowCells, C.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR, unsafe.Pointer(&fgColor))
-			if fgResult == C.GHOSTTY_SUCCESS {
-				screen[row][col].FG = Color{R: uint8(fgColor.r), G: uint8(fgColor.g), B: uint8(fgColor.b)}
-			}
-
-			// Get background color
-			var bgColor C.GhosttyColorRgb
-			bgResult := C.ghostty_render_state_row_cells_get(t.rowCells, C.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR, unsafe.Pointer(&bgColor))
-			if bgResult == C.GHOSTTY_SUCCESS {
-				screen[row][col].BG = Color{R: uint8(bgColor.r), G: uint8(bgColor.g), B: uint8(bgColor.b)}
-			}
-
-			// Get style
-			var cellStyle C.GhosttyStyle
-			C.ghostty_render_state_row_cells_get(t.rowCells, C.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, unsafe.Pointer(&cellStyle))
-			screen[row][col].Bold = bool(cellStyle.bold)
-			screen[row][col].Italic = bool(cellStyle.italic)
-			screen[row][col].Strikethrough = bool(cellStyle.strikethrough)
-			// Underline is an enum in ghostty, convert to bool
-			screen[row][col].Underline = cellStyle.underline != 0
-
+			t.readCellInto(&screen[row][col])
 			col++
 		}
 		row++
 	}
 
 	return screen
+}
+
+// FillScreen reads the terminal screen into a flat caller-owned buffer and cursor state.
+// buf must have capacity for at least cols*rows cells.
+// Returns false if the screen is not dirty (nothing changed since last call).
+// When false is returned, buf and cursor are not modified.
+func (t *Terminal) FillScreen(buf []Cell, cursor *CursorState) bool {
+	return t.fillScreen(buf, cursor, false)
+}
+
+// ForceReadScreen reads the terminal screen unconditionally, ignoring dirty state.
+// Use for initial subscribe and after resize where the client needs a full frame.
+func (t *Terminal) ForceReadScreen(buf []Cell, cursor *CursorState) {
+	t.fillScreen(buf, cursor, true)
+}
+
+func (t *Terminal) fillScreen(buf []Cell, cursor *CursorState, force bool) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Update render state from terminal (consumes terminal dirty flags)
+	C.ghostty_render_state_update(t.renderState, t.term)
+
+	// Check global dirty state
+	var dirty C.GhosttyRenderStateDirty
+	C.ghostty_render_state_get(t.renderState, C.GHOSTTY_RENDER_STATE_DATA_DIRTY, unsafe.Pointer(&dirty))
+
+	if !force && dirty == C.GHOSTTY_RENDER_STATE_DIRTY_FALSE {
+		return false
+	}
+
+	partial := !force && dirty == C.GHOSTTY_RENDER_STATE_DIRTY_PARTIAL
+
+	// Read cursor state (cheap — a few CGO calls)
+	var visible C.bool
+	var hasValue C.bool
+	var cx, cy C.uint16_t
+	var style C.GhosttyRenderStateCursorVisualStyle
+
+	C.ghostty_render_state_get(t.renderState, C.GHOSTTY_RENDER_STATE_DATA_CURSOR_VISIBLE, unsafe.Pointer(&visible))
+	C.ghostty_render_state_get(t.renderState, C.GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_HAS_VALUE, unsafe.Pointer(&hasValue))
+	C.ghostty_render_state_get(t.renderState, C.GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_X, unsafe.Pointer(&cx))
+	C.ghostty_render_state_get(t.renderState, C.GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_Y, unsafe.Pointer(&cy))
+	C.ghostty_render_state_get(t.renderState, C.GHOSTTY_RENDER_STATE_DATA_CURSOR_VISUAL_STYLE, unsafe.Pointer(&style))
+
+	cursorStyle := CursorBlock
+	switch style {
+	case C.GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR:
+		cursorStyle = CursorBar
+	case C.GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE:
+		cursorStyle = CursorUnderline
+	}
+	cursor.X = int(cx)
+	cursor.Y = int(cy)
+	cursor.Visible = bool(visible) && bool(hasValue)
+	cursor.Style = cursorStyle
+
+	// Iterate rows
+	C.ghostty_render_state_get(t.renderState, C.GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, unsafe.Pointer(&t.rowIter))
+
+	row := 0
+	for C.ghostty_render_state_row_iterator_next(t.rowIter) && row < t.rows {
+		rowOffset := row * t.cols
+
+		// In partial mode, skip clean rows
+		if partial {
+			var rowDirty C.bool
+			C.ghostty_render_state_row_get(t.rowIter, C.GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY, unsafe.Pointer(&rowDirty))
+			if !bool(rowDirty) {
+				row++
+				continue
+			}
+			// Reset row dirty flag
+			rowClean := C.bool(false)
+			C.ghostty_render_state_row_set(t.rowIter, C.GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY, unsafe.Pointer(&rowClean))
+		}
+
+		C.ghostty_render_state_row_get(t.rowIter, C.GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, unsafe.Pointer(&t.rowCells))
+
+		col := 0
+		for C.ghostty_render_state_row_cells_next(t.rowCells) && col < t.cols {
+			t.readCellInto(&buf[rowOffset+col])
+			col++
+		}
+
+		// Fill remaining cols as empty
+		for col < t.cols {
+			c := &buf[rowOffset+col]
+			c.Char = ' '
+			c.FG = Color{Default: true}
+			c.BG = Color{Default: true}
+			c.Bold = false
+			c.Italic = false
+			c.Underline = false
+			c.Strikethrough = false
+			col++
+		}
+
+		row++
+	}
+
+	// Reset global dirty state
+	cleanState := C.GHOSTTY_RENDER_STATE_DIRTY_FALSE
+	C.ghostty_render_state_set(t.renderState, C.GHOSTTY_RENDER_STATE_OPTION_DIRTY, unsafe.Pointer(&cleanState))
+
+	return true
+}
+
+// readCellInto reads the current cell from the row cells iterator into dst.
+// Must be called while rowCells is positioned on a valid cell.
+func (t *Terminal) readCellInto(dst *Cell) {
+	// Get grapheme
+	var graphemeLen C.uint32_t
+	C.ghostty_render_state_row_cells_get(t.rowCells, C.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN, unsafe.Pointer(&graphemeLen))
+
+	if graphemeLen > 0 {
+		// Use fixed buffer for graphemes (covers 99.9% of cases)
+		if graphemeLen <= C.uint32_t(len(t.graphemeBuf)) {
+			C.ghostty_render_state_row_cells_get(t.rowCells, C.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF, unsafe.Pointer(&t.graphemeBuf[0]))
+			dst.Char = rune(t.graphemeBuf[0])
+		} else {
+			// Extremely rare: grapheme cluster > 8 codepoints, fall back to alloc
+			buf := make([]C.uint32_t, graphemeLen)
+			C.ghostty_render_state_row_cells_get(t.rowCells, C.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF, unsafe.Pointer(&buf[0]))
+			dst.Char = rune(buf[0])
+		}
+	} else {
+		dst.Char = ' '
+	}
+
+	// Get foreground color
+	var fgColor C.GhosttyColorRgb
+	fgResult := C.ghostty_render_state_row_cells_get(t.rowCells, C.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR, unsafe.Pointer(&fgColor))
+	if fgResult == C.GHOSTTY_SUCCESS {
+		dst.FG = Color{R: uint8(fgColor.r), G: uint8(fgColor.g), B: uint8(fgColor.b)}
+	} else {
+		dst.FG = Color{Default: true}
+	}
+
+	// Get background color
+	var bgColor C.GhosttyColorRgb
+	bgResult := C.ghostty_render_state_row_cells_get(t.rowCells, C.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR, unsafe.Pointer(&bgColor))
+	if bgResult == C.GHOSTTY_SUCCESS {
+		dst.BG = Color{R: uint8(bgColor.r), G: uint8(bgColor.g), B: uint8(bgColor.b)}
+	} else {
+		dst.BG = Color{Default: true}
+	}
+
+	// Get style
+	var cellStyle C.GhosttyStyle
+	cellStyle.size = C.size_t(unsafe.Sizeof(cellStyle))
+	C.ghostty_render_state_row_cells_get(t.rowCells, C.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, unsafe.Pointer(&cellStyle))
+	dst.Bold = bool(cellStyle.bold)
+	dst.Italic = bool(cellStyle.italic)
+	dst.Strikethrough = bool(cellStyle.strikethrough)
+	dst.Underline = cellStyle.underline != 0
 }
 
 // Size returns the current terminal dimensions

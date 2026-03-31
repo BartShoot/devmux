@@ -109,29 +109,15 @@ func (cm *ClientManager) Unsubscribe(client *StreamingClient, paneIDs []protocol
 	}
 }
 
-// GetSubscribers returns all clients subscribed to a pane
-func (cm *ClientManager) GetSubscribers(paneID protocol.PaneID) []*StreamingClient {
-	cm.mu.RLock()
-	defer cm.mu.RUnlock()
-
-	subs := cm.subscribers[paneID]
-	if subs == nil {
-		return nil
-	}
-
-	clients := make([]*StreamingClient, 0, len(subs))
-	for _, client := range subs {
-		clients = append(clients, client)
-	}
-	return clients
-}
-
-// BroadcastToPane sends a message to all subscribers of a pane
+// BroadcastToPane sends a message to all subscribers of a pane.
+// Iterates under read lock to avoid allocating a slice.
 func (cm *ClientManager) BroadcastToPane(paneID protocol.PaneID, msg *protocol.ServerMessage) {
-	clients := cm.GetSubscribers(paneID)
-	for _, client := range clients {
+	cm.mu.RLock()
+	subs := cm.subscribers[paneID]
+	for _, client := range subs {
 		client.Send(msg)
 	}
+	cm.mu.RUnlock()
 }
 
 // Send queues a message to be sent to the client

@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 
 	"devmux/internal/config"
 	"devmux/internal/daemon"
@@ -24,6 +26,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
+
+	// pprof endpoint for profiling
+	go func() {
+		log.Println("pprof listening on http://localhost:6060/debug/pprof/")
+		http.ListenAndServe("localhost:6060", nil)
+	}()
 
 	pm := daemon.NewProcessManager()
 	pm.SetVerbose(*verbose)

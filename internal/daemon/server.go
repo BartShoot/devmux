@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 
 	"devmux/internal/protocol"
+	"devmux/internal/terminal"
 )
 
 // GetSocketPath returns the appropriate socket path for the current platform.
@@ -57,6 +58,11 @@ type Server struct {
 
 	// Last known terminal sizes per pane (for restarts)
 	paneSizes map[protocol.PaneID]struct{ cols, rows int }
+
+	// Reusable cell buffers per pane (avoids alloc on every flush)
+	paneCellBufs map[protocol.PaneID]*protocol.ScreenUpdate
+	// Reusable terminal cell buffers per pane (for FillScreen)
+	paneTermBufs map[protocol.PaneID][]terminal.Cell
 	sizeMu    sync.RWMutex
 }
 
@@ -74,6 +80,8 @@ func NewServer(socketPath string, pm *ProcessManager, layout *protocol.Layout) *
 	s.coalescer = NewUpdateCoalescer(s)
 	s.selectionManager = NewSelectionManager()
 	s.paneSizes = make(map[protocol.PaneID]struct{ cols, rows int })
+	s.paneCellBufs = make(map[protocol.PaneID]*protocol.ScreenUpdate)
+	s.paneTermBufs = make(map[protocol.PaneID][]terminal.Cell)
 
 	// Build pane ID mappings from layout
 	if layout != nil {
@@ -344,22 +352,14 @@ func (s *Server) getLayoutMsgWithStatus() *protocol.LayoutMsg {
 	return layout
 }
 
-// sendFullScreenUpdate sends a full screen update to a client
+// sendFullScreenUpdate sends a full screen update to a client, bypassing dirty tracking.
+// Used for initial subscribe and after resize — the client always needs a complete frame.
 func (s *Server) sendFullScreenUpdate(client *StreamingClient, paneID protocol.PaneID) {
-	name := s.getPaneName(paneID)
-	if name == "" {
-		return
-	}
-
-	// Get process and its terminal
-	s.pm.mu.Lock()
-	proc, exists := s.pm.processes[name]
-	s.pm.mu.Unlock()
-
-	if !exists || proc.Terminal == nil {
+	update := s.forceReadScreenUpdate(paneID)
+	if update == nil {
 		// No terminal yet, send empty placeholder
 		seq := atomic.AddUint64(s.paneSequence[paneID], 1)
-		update := &protocol.ScreenUpdate{
+		update = &protocol.ScreenUpdate{
 			PaneID:   paneID,
 			Sequence: seq,
 			Full:     true,
@@ -368,78 +368,100 @@ func (s *Server) sendFullScreenUpdate(client *StreamingClient, paneID protocol.P
 			Cells:    []protocol.CellData{},
 			Cursor:   protocol.CursorData{X: 0, Y: 0, Visible: true},
 		}
-		client.Send(&protocol.ServerMessage{
-			Type:         protocol.MsgScreenUpdate,
-			ScreenUpdate: update,
-		})
-		return
 	}
-
-	// Get terminal state
-	screen := proc.Terminal.GetScreen()
-	cursor := proc.Terminal.GetCursor()
-	cols, rows := proc.Terminal.Size()
-
-	// Convert to protocol format
-	cells := make([]protocol.CellData, 0, cols*rows)
-	for _, row := range screen {
-		for _, cell := range row {
-			var attrs uint8
-			if cell.Bold {
-				attrs |= protocol.AttrBold
-			}
-			if cell.Italic {
-				attrs |= protocol.AttrItalic
-			}
-			if cell.Underline {
-				attrs |= protocol.AttrUnderline
-			}
-			if cell.Strikethrough {
-				attrs |= protocol.AttrStrikethrough
-			}
-
-			cells = append(cells, protocol.CellData{
-				Char: cell.Char,
-				FG: protocol.Color{
-					R:       cell.FG.R,
-					G:       cell.FG.G,
-					B:       cell.FG.B,
-					Default: cell.FG.Default,
-				},
-				BG: protocol.Color{
-					R:       cell.BG.R,
-					G:       cell.BG.G,
-					B:       cell.BG.B,
-					Default: cell.BG.Default,
-				},
-				Attrs: attrs,
-			})
-		}
-	}
-
-	seq := atomic.AddUint64(s.paneSequence[paneID], 1)
-	update := &protocol.ScreenUpdate{
-		PaneID:   paneID,
-		Sequence: seq,
-		Full:     true,
-		Cols:     uint16(cols),
-		Rows:     uint16(rows),
-		Cells:    cells,
-		Cursor: protocol.CursorData{
-			X:       uint16(cursor.X),
-			Y:       uint16(cursor.Y),
-			Visible: cursor.Visible,
-		},
-	}
-
 	client.Send(&protocol.ServerMessage{
 		Type:         protocol.MsgScreenUpdate,
 		ScreenUpdate: update,
 	})
 }
 
-// materializeScreenUpdate reads terminal state for a pane and builds a ScreenUpdate.
+// forceReadScreenUpdate reads terminal state unconditionally (ignoring dirty tracking).
+func (s *Server) forceReadScreenUpdate(paneID protocol.PaneID) *protocol.ScreenUpdate {
+	name := s.getPaneName(paneID)
+	if name == "" {
+		return nil
+	}
+
+	s.pm.mu.Lock()
+	proc, exists := s.pm.processes[name]
+	s.pm.mu.Unlock()
+
+	if !exists || proc.Terminal == nil {
+		return nil
+	}
+
+	cols, rows := proc.Terminal.Size()
+	totalCells := cols * rows
+
+	cellBuf := s.getTermCellBuf(paneID, totalCells)
+
+	var cursor terminal.CursorState
+	proc.Terminal.ForceReadScreen(cellBuf, &cursor)
+
+	update := s.paneCellBufs[paneID]
+	if update == nil || cap(update.Cells) < totalCells {
+		update = &protocol.ScreenUpdate{
+			Cells: make([]protocol.CellData, totalCells),
+		}
+		s.paneCellBufs[paneID] = update
+	}
+	update.Cells = update.Cells[:totalCells]
+
+	for i, cell := range cellBuf {
+		c := &update.Cells[i]
+		c.Char = cell.Char
+		c.FG.R = cell.FG.R
+		c.FG.G = cell.FG.G
+		c.FG.B = cell.FG.B
+		c.FG.Default = cell.FG.Default
+		c.BG.R = cell.BG.R
+		c.BG.G = cell.BG.G
+		c.BG.B = cell.BG.B
+		c.BG.Default = cell.BG.Default
+
+		var attrs uint8
+		if cell.Bold {
+			attrs |= protocol.AttrBold
+		}
+		if cell.Italic {
+			attrs |= protocol.AttrItalic
+		}
+		if cell.Underline {
+			attrs |= protocol.AttrUnderline
+		}
+		if cell.Strikethrough {
+			attrs |= protocol.AttrStrikethrough
+		}
+		c.Attrs = attrs
+	}
+
+	seq := atomic.AddUint64(&proc.updateSeq, 1)
+
+	update.PaneID = paneID
+	update.Sequence = seq
+	update.Full = true
+	update.Cols = uint16(cols)
+	update.Rows = uint16(rows)
+	update.Cursor.X = uint16(cursor.X)
+	update.Cursor.Y = uint16(cursor.Y)
+	update.Cursor.Visible = cursor.Visible
+
+	return update
+}
+
+// getTermCellBuf returns a reusable terminal cell buffer for the given pane, growing if needed.
+func (s *Server) getTermCellBuf(paneID protocol.PaneID, size int) []terminal.Cell {
+	buf := s.paneTermBufs[paneID]
+	if cap(buf) < size {
+		buf = make([]terminal.Cell, size)
+		s.paneTermBufs[paneID] = buf
+	}
+	return buf[:size]
+}
+
+// materializeScreenUpdate reads terminal state for a pane into a reusable ScreenUpdate.
 // Called only from coalescer flush — not on every stdout read.
+// Returns nil if the pane doesn't exist or the terminal has no dirty state.
 func (s *Server) materializeScreenUpdate(paneID protocol.PaneID) *protocol.ScreenUpdate {
 	name := s.getPaneName(paneID)
 	if name == "" {
@@ -454,61 +476,69 @@ func (s *Server) materializeScreenUpdate(paneID protocol.PaneID) *protocol.Scree
 		return nil
 	}
 
-	screen := proc.Terminal.GetScreen()
-	cursor := proc.Terminal.GetCursor()
 	cols, rows := proc.Terminal.Size()
+	totalCells := cols * rows
 
-	cells := make([]protocol.CellData, 0, cols*rows)
-	for _, row := range screen {
-		for _, cell := range row {
-			var attrs uint8
-			if cell.Bold {
-				attrs |= protocol.AttrBold
-			}
-			if cell.Italic {
-				attrs |= protocol.AttrItalic
-			}
-			if cell.Underline {
-				attrs |= protocol.AttrUnderline
-			}
-			if cell.Strikethrough {
-				attrs |= protocol.AttrStrikethrough
-			}
+	// Ensure we have a reusable terminal cell buffer for FillScreen
+	cellBuf := s.getTermCellBuf(paneID, totalCells)
 
-			cells = append(cells, protocol.CellData{
-				Char: cell.Char,
-				FG: protocol.Color{
-					R:       cell.FG.R,
-					G:       cell.FG.G,
-					B:       cell.FG.B,
-					Default: cell.FG.Default,
-				},
-				BG: protocol.Color{
-					R:       cell.BG.R,
-					G:       cell.BG.G,
-					B:       cell.BG.B,
-					Default: cell.BG.Default,
-				},
-				Attrs: attrs,
-			})
+	// FillScreen returns false if nothing changed (dirty tracking)
+	var cursor terminal.CursorState
+	if !proc.Terminal.FillScreen(cellBuf, &cursor) {
+		return nil
+	}
+
+	// Reuse or grow the per-pane protocol cell buffer
+	update := s.paneCellBufs[paneID]
+	if update == nil || cap(update.Cells) < totalCells {
+		update = &protocol.ScreenUpdate{
+			Cells: make([]protocol.CellData, totalCells),
 		}
+		s.paneCellBufs[paneID] = update
+	}
+	update.Cells = update.Cells[:totalCells]
+
+	// Convert terminal cells to protocol cells in-place
+	for i, cell := range cellBuf {
+		c := &update.Cells[i]
+		c.Char = cell.Char
+		c.FG.R = cell.FG.R
+		c.FG.G = cell.FG.G
+		c.FG.B = cell.FG.B
+		c.FG.Default = cell.FG.Default
+		c.BG.R = cell.BG.R
+		c.BG.G = cell.BG.G
+		c.BG.B = cell.BG.B
+		c.BG.Default = cell.BG.Default
+
+		var attrs uint8
+		if cell.Bold {
+			attrs |= protocol.AttrBold
+		}
+		if cell.Italic {
+			attrs |= protocol.AttrItalic
+		}
+		if cell.Underline {
+			attrs |= protocol.AttrUnderline
+		}
+		if cell.Strikethrough {
+			attrs |= protocol.AttrStrikethrough
+		}
+		c.Attrs = attrs
 	}
 
 	seq := atomic.AddUint64(&proc.updateSeq, 1)
 
-	return &protocol.ScreenUpdate{
-		PaneID:   paneID,
-		Sequence: seq,
-		Full:     true,
-		Cols:     uint16(cols),
-		Rows:     uint16(rows),
-		Cells:    cells,
-		Cursor: protocol.CursorData{
-			X:       uint16(cursor.X),
-			Y:       uint16(cursor.Y),
-			Visible: cursor.Visible,
-		},
-	}
+	update.PaneID = paneID
+	update.Sequence = seq
+	update.Full = true
+	update.Cols = uint16(cols)
+	update.Rows = uint16(rows)
+	update.Cursor.X = uint16(cursor.X)
+	update.Cursor.Y = uint16(cursor.Y)
+	update.Cursor.Visible = cursor.Visible
+
+	return update
 }
 
 // BroadcastPaneStatus sends a pane status update to all subscribers

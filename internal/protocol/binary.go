@@ -127,6 +127,13 @@ func NewBinaryReader(r io.Reader) *BinaryReader {
 
 // ReadServerMessage reads and decodes one framed ServerMessage.
 func (br *BinaryReader) ReadServerMessage() (*ServerMessage, error) {
+	return br.ReadServerMessageReuse(nil)
+}
+
+// ReadServerMessageReuse reads a ServerMessage, reusing per-pane ScreenUpdate buffers
+// from the provided map to avoid allocation on the hot path.
+// If reuse is nil, behaves like ReadServerMessage.
+func (br *BinaryReader) ReadServerMessageReuse(reuse map[PaneID]*ScreenUpdate) (*ServerMessage, error) {
 	payload, err := br.readFrame()
 	if err != nil {
 		return nil, err
@@ -142,7 +149,16 @@ func (br *BinaryReader) ReadServerMessage() (*ServerMessage, error) {
 	case MsgLayout:
 		msg.Layout, err = decodeLayout(data)
 	case MsgScreenUpdate:
-		msg.ScreenUpdate, err = decodeScreenUpdate(data)
+		// Peek at pane ID to find reuse buffer (first 4 bytes of data)
+		var reuseBuf *ScreenUpdate
+		if reuse != nil && len(data) >= 4 {
+			paneID := PaneID(binary.BigEndian.Uint32(data[0:4]))
+			reuseBuf = reuse[paneID]
+		}
+		msg.ScreenUpdate, err = DecodeScreenUpdateInto(data, reuseBuf)
+		if err == nil && reuse != nil {
+			reuse[msg.ScreenUpdate.PaneID] = msg.ScreenUpdate
+		}
 	case MsgSelection:
 		msg.Selection, err = decodeSelection(data)
 	case MsgPaneStatus:
@@ -295,27 +311,43 @@ func (bw *BinaryWriter) encodeCell(c *CellData) {
 	bw.appendU8(packed)
 }
 
+// decodeScreenUpdate decodes a screen update from binary data.
+// If reuse is non-nil and its Cells slice has sufficient capacity, it will be reused.
 func decodeScreenUpdate(data []byte) (*ScreenUpdate, error) {
+	return DecodeScreenUpdateInto(data, nil)
+}
+
+// DecodeScreenUpdateInto decodes a screen update, reusing the provided ScreenUpdate's
+// Cells buffer if it has sufficient capacity. This avoids per-frame allocation.
+func DecodeScreenUpdateInto(data []byte, reuse *ScreenUpdate) (*ScreenUpdate, error) {
 	if len(data) < 22 {
 		return nil, fmt.Errorf("screen update too short: %d bytes", len(data))
 	}
 
-	u := &ScreenUpdate{
-		PaneID:   PaneID(binary.BigEndian.Uint32(data[0:4])),
-		Sequence: binary.BigEndian.Uint64(data[4:12]),
-		Full:     data[12]&1 != 0,
-		Cols:     binary.BigEndian.Uint16(data[13:15]),
-		Rows:     binary.BigEndian.Uint16(data[15:17]),
-		Cursor: CursorData{
-			X:       binary.BigEndian.Uint16(data[17:19]),
-			Y:       binary.BigEndian.Uint16(data[19:21]),
-			Visible: data[21] != 0,
-		},
+	var u *ScreenUpdate
+	if reuse != nil {
+		u = reuse
+	} else {
+		u = &ScreenUpdate{}
 	}
 
-	// Decode sparse cells
+	u.PaneID = PaneID(binary.BigEndian.Uint32(data[0:4]))
+	u.Sequence = binary.BigEndian.Uint64(data[4:12])
+	u.Full = data[12]&1 != 0
+	u.Cols = binary.BigEndian.Uint16(data[13:15])
+	u.Rows = binary.BigEndian.Uint16(data[15:17])
+	u.Cursor.X = binary.BigEndian.Uint16(data[17:19])
+	u.Cursor.Y = binary.BigEndian.Uint16(data[19:21])
+	u.Cursor.Visible = data[21] != 0
+
+	// Reuse or allocate cell buffer
 	totalCells := int(u.Cols) * int(u.Rows)
-	u.Cells = make([]CellData, totalCells)
+	if cap(u.Cells) >= totalCells {
+		u.Cells = u.Cells[:totalCells]
+	} else {
+		u.Cells = make([]CellData, totalCells)
+	}
+
 	pos := 0
 	offset := 22
 
@@ -330,15 +362,12 @@ func decodeScreenUpdate(data []byte) (*ScreenUpdate, error) {
 			}
 			count := int(data[offset])
 			offset++
-			// Empty cells are zero-valued (Char=0, Default=false, Attrs=0)
-			// We need to set them as proper empty cells
 			for j := 0; j < count && pos < totalCells; j++ {
-				u.Cells[pos] = CellData{
-					Char:  ' ',
-					FG:    Color{Default: true},
-					BG:    Color{Default: true},
-					Attrs: 0,
-				}
+				c := &u.Cells[pos]
+				c.Char = ' '
+				c.FG = Color{Default: true}
+				c.BG = Color{Default: true}
+				c.Attrs = 0
 				pos++
 			}
 
@@ -368,11 +397,11 @@ func decodeScreenUpdate(data []byte) (*ScreenUpdate, error) {
 
 	// Fill remaining cells as empty
 	for pos < totalCells {
-		u.Cells[pos] = CellData{
-			Char:  ' ',
-			FG:    Color{Default: true},
-			BG:    Color{Default: true},
-		}
+		c := &u.Cells[pos]
+		c.Char = ' '
+		c.FG = Color{Default: true}
+		c.BG = Color{Default: true}
+		c.Attrs = 0
 		pos++
 	}
 

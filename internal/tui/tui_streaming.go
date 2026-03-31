@@ -100,26 +100,33 @@ func (t *StreamingTUI) Run() error {
 	t.tabBar = tview.NewTextView().
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignLeft)
-	t.tabBar.SetBackgroundColor(tcell.ColorDarkBlue)
+	t.tabBar.SetBackgroundColor(colMantle)
+	t.tabBar.SetTextColor(colText)
 
 	// Create status bar
 	t.statusBar = tview.NewTextView().
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignLeft)
-	t.statusBar.SetBackgroundColor(tcell.ColorDarkBlue)
+	t.statusBar.SetBackgroundColor(colMantle)
+	t.statusBar.SetTextColor(colText)
 	t.updateStatusBar()
+
+	// Set background on pages container
+	t.pages.SetBackgroundColor(colBase)
 
 	// Main layout: tab bar on top, content in middle, status bar on bottom
 	mainFlex := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(t.tabBar, 1, 0, false).
 		AddItem(t.pages, 0, 1, true).
 		AddItem(t.statusBar, 1, 0, false)
+	mainFlex.SetBackgroundColor(colBase)
 
 	// Global input handling
 	t.app.SetInputCapture(t.handleInput)
 
-	// Handle window resize
-	t.app.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
+	// After each draw, check if any pane sizes changed and send resize messages.
+	// This runs after tview has computed actual layout dimensions.
+	t.app.SetAfterDrawFunc(func(screen tcell.Screen) {
 		t.mu.Lock()
 		for paneID, tv := range t.panes {
 			width, height := tv.GetInnerSize()
@@ -132,7 +139,6 @@ func (t *StreamingTUI) Run() error {
 			}
 		}
 		t.mu.Unlock()
-		return false
 	})
 
 	t.app.SetRoot(mainFlex, true)
@@ -243,20 +249,12 @@ func (t *StreamingTUI) subscribeToAllPanes() {
 		t.client.SendSubscribe(paneIDs)
 	}
 
-	go func() {
-		t.app.QueueUpdateDraw(func() {
-			t.sendResizeForAllPanes()
-		})
-	}()
-}
-
-// sendResizeForAllPanes sends resize messages for all panes based on their actual size
-func (t *StreamingTUI) sendResizeForAllPanes() {
-	for paneID, tv := range t.panes {
-		width, height := tv.GetInnerSize()
-		if width > 0 && height > 0 {
-			t.client.SendResize(paneID, width, height)
-		}
+	// Mark all panes as needing initial resize.
+	// The BeforeDrawFunc will pick these up on the first actual draw
+	// when tview has computed real sizes.
+	for _, tv := range t.panes {
+		tv.viewCols = 0
+		tv.viewRows = 0
 	}
 }
 
@@ -500,6 +498,24 @@ func (t *StreamingTUI) switchTab(index int) {
 	// Reset focus to first pane in new tab
 	t.focusIndex = 0
 	t.updateFocus()
+
+	// Force resize for panes in the new tab — they may not have been
+	// drawn yet, so schedule it after the next draw calculates sizes.
+	go func() {
+		t.app.QueueUpdateDraw(func() {
+			t.mu.Lock()
+			panes := t.currentTabPanes()
+			for _, tv := range panes {
+				width, height := tv.GetInnerSize()
+				if width > 0 && height > 0 {
+					tv.viewCols = width
+					tv.viewRows = height
+					go t.client.SendResize(tv.paneID, width, height)
+				}
+			}
+			t.mu.Unlock()
+		})
+	}()
 }
 
 // updateTabBar updates the tab bar display
@@ -507,12 +523,12 @@ func (t *StreamingTUI) updateTabBar() {
 	var parts []string
 	for i, tab := range t.tabs {
 		if i == t.currentTab {
-			parts = append(parts, fmt.Sprintf("[black:white] %d:%s [-:-]", i+1, tab.name))
+			parts = append(parts, fmt.Sprintf("[#1e1e2e:#b4befe] %d:%s [-:-]", i+1, tab.name))
 		} else {
-			parts = append(parts, fmt.Sprintf(" %d:%s ", i+1, tab.name))
+			parts = append(parts, fmt.Sprintf("[#a6adc8:-] %d:%s [-:-]", i+1, tab.name))
 		}
 	}
-	t.tabBar.SetText(strings.Join(parts, "|"))
+	t.tabBar.SetText(strings.Join(parts, "[#6c7086]|[-]"))
 }
 
 // updateStatusBar updates the status bar text with current mode.
@@ -524,9 +540,9 @@ func (t *StreamingTUI) updateStatusBar() {
 
 	switch mode {
 	case ModeNormal:
-		t.statusBar.SetText("[white:darkblue] -- NORMAL -- [-:-]  [gray]hjkl:focus  1-9:tab  i:insert  q:quit[-]")
+		t.statusBar.SetText("[#1e1e2e:#89b4fa] -- NORMAL -- [-:-]  [#6c7086]hjkl:focus  1-9:tab  i:insert  q:quit[-]")
 	case ModeInsert:
-		t.statusBar.SetText("[black:green] -- INSERT -- [-:-]  [gray]Esc:normal[-]")
+		t.statusBar.SetText("[#1e1e2e:#a6e3a1] -- INSERT -- [-:-]  [#6c7086]Esc:normal[-]")
 	}
 }
 
@@ -535,36 +551,38 @@ func (t *StreamingTUI) updateFocus() {
 	panes := t.currentTabPanes()
 	for i, tv := range panes {
 		if i == t.focusIndex {
-			tv.SetBorderColor(tcell.ColorYellow)
+			tv.SetBorderColor(colLavender)
+			tv.SetTitleColor(colLavender)
 			t.app.SetFocus(tv)
 		} else {
-			tv.SetBorderColor(tcell.ColorWhite)
+			tv.SetBorderColor(colOverlay0)
+			tv.SetTitleColor(colSubtext0)
 		}
 	}
 }
 
-// formatPaneTitle creates a title with status indicator
+// formatPaneTitle creates a title with status indicator using Catppuccin colors
 func formatPaneTitle(name string, running bool, status string) string {
 	var indicator string
 	var color string
 
 	if !running {
 		indicator = "x"
-		color = "red"
+		color = "#f38ba8" // red
 	} else {
 		switch status {
 		case "Healthy":
 			indicator = "o"
-			color = "green"
+			color = "#a6e3a1" // green
 		case "Checking":
 			indicator = "~"
-			color = "yellow"
+			color = "#f9e2af" // yellow
 		case "Unhealthy":
 			indicator = "!"
-			color = "orange"
+			color = "#fab387" // peach
 		default:
 			indicator = "?"
-			color = "gray"
+			color = "#6c7086" // overlay0
 		}
 	}
 

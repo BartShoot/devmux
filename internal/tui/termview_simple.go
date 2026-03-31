@@ -36,7 +36,10 @@ func NewSimpleTerminalView(paneID protocol.PaneID, name string) *SimpleTerminalV
 		rows:   24,
 	}
 	tv.SetBorder(true)
+	tv.SetBackgroundColor(colBase)
+	tv.SetBorderColor(colOverlay0)
 	tv.SetTitle(" " + name + " ")
+	tv.SetTitleColor(colSubtext0)
 	return tv
 }
 
@@ -76,8 +79,8 @@ func (tv *SimpleTerminalView) Draw(screen tcell.Screen) {
 		return
 	}
 
-	// Default style
-	defStyle := tcell.StyleDefault.Background(tcell.ColorBlack).Foreground(tcell.ColorWhite)
+	// Default style — Catppuccin Mocha base
+	defStyle := tcell.StyleDefault.Background(colBase).Foreground(colText)
 
 	// Render cells
 	cellIndex := 0

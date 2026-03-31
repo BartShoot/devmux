@@ -59,8 +59,11 @@ func (c *StreamClient) Close() error {
 // ReceiveLoop reads binary messages from the server and dispatches to handlers.
 // This should be run in a goroutine.
 func (c *StreamClient) ReceiveLoop() error {
+	// Per-pane reuse buffers — avoids allocating []CellData on every frame
+	reuse := make(map[protocol.PaneID]*protocol.ScreenUpdate)
+
 	for {
-		msg, err := c.reader.ReadServerMessage()
+		msg, err := c.reader.ReadServerMessageReuse(reuse)
 		if err != nil {
 			c.mu.Lock()
 			closed := c.closed

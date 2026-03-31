@@ -189,6 +189,26 @@ func (t *Terminal) GetScreen() [][]Cell {
 	return screen
 }
 
+// FillScreen reads the terminal screen into a flat caller-owned buffer.
+// buf must have capacity for at least cols*rows cells.
+// Always returns true for the stub (no dirty tracking).
+func (t *Terminal) FillScreen(buf []Cell, cursor *CursorState) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	for i := 0; i < t.rows; i++ {
+		copy(buf[i*t.cols:(i+1)*t.cols], t.buffer[i])
+	}
+	*cursor = t.cursor
+	return true
+}
+
+// ForceReadScreen reads the terminal screen unconditionally.
+// For the stub, this is identical to FillScreen.
+func (t *Terminal) ForceReadScreen(buf []Cell, cursor *CursorState) {
+	t.FillScreen(buf, cursor)
+}
+
 // Size returns the current terminal dimensions
 func (t *Terminal) Size() (cols, rows int) {
 	t.mu.Lock()
