@@ -1,0 +1,77 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+    - go run scripts/build_deps.go
+
+builds:
+  # 1. THE DAEMON - LINUX
+  - id: devmuxd-linux
+    main: ./cmd/devmuxd
+    binary: devmuxd
+    goos: [linux]
+    goarch: [amd64]
+    env:
+      - CGO_ENABLED=1
+      - CC=zig cc -lc -target x86_64-linux-gnu
+    flags:
+      - -tags=ghostty
+    ldflags:
+      - -s -w
+
+  # 2. THE DAEMON - WINDOWS
+  - id: devmuxd-windows
+    main: ./cmd/devmuxd
+    binary: devmuxd
+    goos: [windows]
+    goarch: [amd64]
+    env:
+      - CGO_ENABLED=1
+      - CC=zig cc -lc -target x86_64-windows-gnu
+    flags:
+      - -tags=ghostty
+    ldflags:
+      - -s -w
+
+  # 3. THE CLI (Pure Go - works for both)
+  - id: devmux-cli
+    main: ./cmd/devmux
+    binary: devmux
+    goos: [linux, windows]
+    goarch: [amd64]
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+
+archives:
+  - name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    # FIX: 'builds' is now 'ids'
+    ids:
+      - devmuxd-linux
+      - devmuxd-windows
+      - devmuxd
+    # FIX: format_overrides is discouraged.
+    # Use 'format' for the primary and 'formats' for extras.
+    # GoReleaser is smart: it knows Windows should be zip if included in formats.
+    formats:
+      - zip
+    files:
+      - src: third_party/ghostty/lib/*.dll
+        dst: .
+        strip_parent: true
+
+nfpms:
+  - package_name: devmux
+    # FIX: maintainer is now required
+    maintainer: "Bartosz Dobija <dobija.bartosz@gmail.com>"
+    vendor: "devmux"
+    description: "Terminal process manager and multiplexer."
+    formats:
+      - deb
+    contents:
+      - src: devmux
+        dst: /usr/bin/devmux
+      - src: devmuxd
+        dst: /usr/bin/devmuxd
