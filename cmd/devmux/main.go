@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,12 +20,17 @@ func main() {
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: devmux <command> [args]")
 		fmt.Println("Commands:")
-		fmt.Println("  start              Start the daemon")
-		fmt.Println("  stop               Stop the daemon")
-		fmt.Println("  ui                 Open the TUI")
-		fmt.Println("  status             Show process status")
+		fmt.Println("  start                  Start the daemon")
+		fmt.Println("  stop                   Stop the daemon")
+		fmt.Println("  ui                     Open the TUI")
+		fmt.Println("  status [name]          Show process status (all or specific)")
 		fmt.Println("  restart <name> [--wait]  Restart a process (--wait waits for healthy)")
-		fmt.Println("  logs <name>        Show process logs")
+		fmt.Println("  logs <name> [flags]    Show process logs")
+		fmt.Println("    --tail N             Show only last N lines")
+		fmt.Println("    --grep PATTERN       Filter lines containing PATTERN")
+		fmt.Println("    -A N                 Show N lines after each match")
+		fmt.Println("    -B N                 Show N lines before each match")
+		fmt.Println("    -C N                 Show N lines before and after each match")
 		os.Exit(1)
 	}
 
@@ -63,8 +69,12 @@ func main() {
 	// Parse arguments for restart command
 	var processName string
 	var waitForHealthy bool
+	var tailN int
+	var grepPattern string
+	var ctxAfter, ctxBefore int
 
-	if command == "restart" {
+	switch command {
+	case "restart":
 		for _, arg := range os.Args[2:] {
 			if arg == "--wait" || arg == "-w" {
 				waitForHealthy = true
@@ -75,11 +85,75 @@ func main() {
 		if processName == "" {
 			log.Fatal("Usage: devmux restart <name> [--wait]")
 		}
-	} else if len(os.Args) > 2 {
-		processName = os.Args[2]
+	case "logs":
+		args := os.Args[2:]
+		for i := 0; i < len(args); i++ {
+			switch args[i] {
+			case "--tail":
+				i++
+				if i >= len(args) {
+					log.Fatal("--tail requires a number")
+				}
+				n, err := strconv.Atoi(args[i])
+				if err != nil {
+					log.Fatalf("--tail: invalid number %q", args[i])
+				}
+				tailN = n
+			case "--grep":
+				i++
+				if i >= len(args) {
+					log.Fatal("--grep requires a pattern")
+				}
+				grepPattern = args[i]
+			case "-A":
+				i++
+				if i >= len(args) {
+					log.Fatal("-A requires a number")
+				}
+				n, err := strconv.Atoi(args[i])
+				if err != nil {
+					log.Fatalf("-A: invalid number %q", args[i])
+				}
+				ctxAfter = n
+			case "-B":
+				i++
+				if i >= len(args) {
+					log.Fatal("-B requires a number")
+				}
+				n, err := strconv.Atoi(args[i])
+				if err != nil {
+					log.Fatalf("-B: invalid number %q", args[i])
+				}
+				ctxBefore = n
+			case "-C":
+				i++
+				if i >= len(args) {
+					log.Fatal("-C requires a number")
+				}
+				n, err := strconv.Atoi(args[i])
+				if err != nil {
+					log.Fatalf("-C: invalid number %q", args[i])
+				}
+				ctxBefore = n
+				ctxAfter = n
+			default:
+				if !strings.HasPrefix(args[i], "-") {
+					processName = args[i]
+				} else {
+					log.Fatalf("Unknown flag: %s", args[i])
+				}
+			}
+		}
+		if processName == "" {
+			log.Fatal("Usage: devmux logs <name> [--tail N] [--grep PATTERN] [-A N] [-B N] [-C N]")
+		}
+	default:
+		if len(os.Args) > 2 {
+			processName = os.Args[2]
+		}
 	}
 
-	req := protocol.Request{Command: command, Name: processName}
+	req := protocol.Request{Command: command, Name: processName, Tail: tailN}
 	if command == "stop" {
 		req.Command = "shutdown"
 	}
@@ -91,6 +165,26 @@ func main() {
 	var resp protocol.Response
 	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
 		log.Fatalf("Failed to read response: %v", err)
+	}
+
+	// Apply client-side grep filtering for logs
+	if command == "logs" && resp.Status == "ok" && grepPattern != "" {
+		resp.Message = grepLines(resp.Message, grepPattern, ctxBefore, ctxAfter)
+	}
+
+	// Filter status output to a single service if name was provided
+	if command == "status" && resp.Status == "ok" && processName != "" {
+		filtered := ""
+		for _, line := range strings.Split(resp.Message, "\n") {
+			if strings.HasPrefix(line, processName+":") {
+				filtered = line
+				break
+			}
+		}
+		if filtered == "" {
+			log.Fatalf("Process %s not found", processName)
+		}
+		resp.Message = filtered
 	}
 
 	fmt.Printf("%s: %s\n", resp.Status, resp.Message)
@@ -162,4 +256,57 @@ func getProcessStatus(name string) (string, error) {
 	}
 
 	return "", fmt.Errorf("process %s not found in status", name)
+}
+
+// grepLines filters lines by pattern with optional before/after context.
+func grepLines(text, pattern string, before, after int) string {
+	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
+	if len(lines) == 0 {
+		return ""
+	}
+
+	// Find matching line indices
+	var matches []int
+	for i, line := range lines {
+		if strings.Contains(line, pattern) {
+			matches = append(matches, i)
+		}
+	}
+
+	if len(matches) == 0 {
+		return ""
+	}
+
+	// Build set of lines to include (matches + context)
+	include := make([]bool, len(lines))
+	for _, m := range matches {
+		start := m - before
+		if start < 0 {
+			start = 0
+		}
+		end := m + after
+		if end >= len(lines) {
+			end = len(lines) - 1
+		}
+		for i := start; i <= end; i++ {
+			include[i] = true
+		}
+	}
+
+	// Collect included lines, inserting "--" separator between non-contiguous groups
+	var result []string
+	prevIncluded := false
+	for i, line := range lines {
+		if include[i] {
+			if !prevIncluded && len(result) > 0 {
+				result = append(result, "--")
+			}
+			result = append(result, line)
+			prevIncluded = true
+		} else {
+			prevIncluded = false
+		}
+	}
+
+	return strings.Join(result, "\n") + "\n"
 }
