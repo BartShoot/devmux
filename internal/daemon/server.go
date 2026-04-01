@@ -6,38 +6,12 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"path/filepath"
-	"runtime"
 	"sync"
 	"sync/atomic"
 
 	"devmux/internal/protocol"
 	"devmux/internal/terminal"
 )
-
-// GetSocketPath returns the appropriate socket path for the current platform.
-// On Unix systems, uses Unix domain socket. On Windows, falls back to TCP.
-func GetSocketPath() string {
-	if runtime.GOOS == "windows" {
-		return "localhost:8888"
-	}
-
-	// Prefer XDG_RUNTIME_DIR if available (systemd-based systems)
-	if xdgRuntime := os.Getenv("XDG_RUNTIME_DIR"); xdgRuntime != "" {
-		return filepath.Join(xdgRuntime, "devmux.sock")
-	}
-
-	// Fallback to /tmp
-	return "/tmp/devmux.sock"
-}
-
-// GetSocketNetwork returns the network type for the socket.
-func GetSocketNetwork() string {
-	if runtime.GOOS == "windows" {
-		return "tcp"
-	}
-	return "unix"
-}
 
 type Server struct {
 	socketPath       string
@@ -104,8 +78,8 @@ func NewServer(socketPath string, pm *ProcessManager, layout *protocol.Layout) *
 }
 
 func (s *Server) Start() error {
-	network := GetSocketNetwork()
-	address := GetSocketPath()
+	network := protocol.GetSocketNetwork()
+	address := protocol.GetSocketPath()
 
 	// For Unix sockets, remove stale socket file if it exists
 	if network == "unix" {
@@ -228,14 +202,18 @@ func (s *Server) handleLegacyRequest(conn net.Conn, encoder *json.Encoder, req *
 				lines := p.Buffer.GetLines()
 				totalLines := len(lines)
 
-				if req.Tail > 0 && req.Tail < totalLines {
-					lines = lines[totalLines-req.Tail:]
-				} else if req.Offset < totalLines {
-					lines = lines[req.Offset:]
-				} else if req.Offset > totalLines {
-					lines = lines[:]
-				} else {
-					lines = []string{}
+				// Apply tailing if requested
+				if req.Tail > 0 {
+					if req.Tail < totalLines {
+						lines = lines[totalLines-req.Tail:]
+					}
+				} else if req.Offset > 0 {
+					// Apply offset if requested and tailing is not used
+					if req.Offset < totalLines {
+						lines = lines[req.Offset:]
+					} else {
+						lines = []string{}
+					}
 				}
 
 				message := ""

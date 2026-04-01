@@ -7,9 +7,6 @@ import (
 	"math"
 )
 
-// Binary protocol magic bytes - sent by client as first 4 bytes to identify binary protocol
-var BinaryMagic = [4]byte{'D', 'M', 'X', 0x01}
-
 // Wire frame: [4-byte payload length (big-endian)][1-byte msg type][payload]
 
 // Cell encoding opcodes
