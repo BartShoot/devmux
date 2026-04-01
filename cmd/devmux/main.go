@@ -7,11 +7,11 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
-	"devmux/internal/daemon"
 	"devmux/internal/protocol"
 	"devmux/internal/tui"
 )
@@ -37,26 +37,44 @@ func main() {
 	command := os.Args[1]
 
 	if command == "start" {
-		cmd := exec.Command("go", "run", "cmd/devmuxd/main.go")
-		// On Windows, Start-Process or similar might be better for true detaching,
-		// but for a simple "go run" backgrounding:
-		if err := cmd.Start(); err != nil {
-			log.Fatalf("Failed to start daemon: %v", err)
+		config := "devmux.yaml"
+		if len(os.Args) > 2 {
+			config = os.Args[2]
 		}
-		fmt.Printf("Daemon started with PID %d\n", cmd.Process.Pid)
+
+		if runtime.GOOS == "windows" {
+			// On Windows, use PowerShell to start the process in the background properly
+			buildCmd := exec.Command("go", "build", "-o", "bin/devmuxd.exe", "./cmd/devmuxd")
+			if err := buildCmd.Run(); err != nil {
+				log.Fatalf("Failed to build daemon: %v", err)
+			}
+
+			psCmd := fmt.Sprintf("Start-Process -NoNewWindow -FilePath \".\\bin\\devmuxd.exe\" -ArgumentList \"%s\"", config)
+			cmd := exec.Command("powershell", "-Command", psCmd)
+			if err := cmd.Run(); err != nil {
+				log.Fatalf("Failed to start daemon via PowerShell: %v", err)
+			}
+			fmt.Println("Daemon started in background.")
+		} else {
+			cmd := exec.Command("go", "run", "cmd/devmuxd/main.go", config)
+			if err := cmd.Start(); err != nil {
+				log.Fatalf("Failed to start daemon: %v", err)
+			}
+			fmt.Printf("Daemon started with PID %d\n", cmd.Process.Pid)
+		}
 		return
 	}
 
 	if command == "ui" {
 		// Use streaming TUI (works without CGO)
-		ui := tui.NewStreamingTUI(daemon.GetSocketNetwork(), daemon.GetSocketPath())
+		ui := tui.NewStreamingTUI(protocol.GetSocketNetwork(), protocol.GetSocketPath())
 		if err := ui.Run(); err != nil {
 			log.Fatalf("UI error: %v", err)
 		}
 		return
 	}
 
-	conn, err := net.Dial(daemon.GetSocketNetwork(), daemon.GetSocketPath())
+	conn, err := net.Dial(protocol.GetSocketNetwork(), protocol.GetSocketPath())
 	if err != nil {
 		if command == "stop" {
 			fmt.Println("Daemon is not running.")
@@ -223,7 +241,7 @@ func waitForHealthyStatus(name string) error {
 
 // getProcessStatus queries the daemon for a process's health status
 func getProcessStatus(name string) (string, error) {
-	conn, err := net.Dial(daemon.GetSocketNetwork(), daemon.GetSocketPath())
+	conn, err := net.Dial(protocol.GetSocketNetwork(), protocol.GetSocketPath())
 	if err != nil {
 		return "", fmt.Errorf("failed to connect to daemon: %w", err)
 	}

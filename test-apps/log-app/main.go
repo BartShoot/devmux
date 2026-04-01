@@ -13,6 +13,6 @@ func main() {
 	// Keep running with periodic output
 	for {
 		fmt.Printf("[%s] [info] dev-server heartbeat - listening on http://localhost:5173\n", time.Now().Format("15:04:05"))
-		time.Sleep(2 * time.Second)
+		time.Sleep(500 * time.Millisecond)
 	}
 }

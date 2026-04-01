@@ -1,5 +1,38 @@
 package protocol
 
+import (
+	"os"
+	"path/filepath"
+	"runtime"
+)
+
+// Binary protocol magic bytes - sent by client as first 4 bytes to identify binary protocol
+var BinaryMagic = [4]byte{'D', 'M', 'X', 0x01}
+
+// GetSocketPath returns the appropriate socket path for the current platform.
+// On Unix systems, uses Unix domain socket. On Windows, falls back to TCP.
+func GetSocketPath() string {
+	if runtime.GOOS == "windows" {
+		return "127.0.0.1:8888"
+	}
+
+	// Prefer XDG_RUNTIME_DIR if available (systemd-based systems)
+	if xdgRuntime := os.Getenv("XDG_RUNTIME_DIR"); xdgRuntime != "" {
+		return filepath.Join(xdgRuntime, "devmux.sock")
+	}
+
+	// Fallback to /tmp
+	return "/tmp/devmux.sock"
+}
+
+// GetSocketNetwork returns the network type for the socket.
+func GetSocketNetwork() string {
+	if runtime.GOOS == "windows" {
+		return "tcp"
+	}
+	return "unix"
+}
+
 // ============================================================================
 // Legacy Protocol (kept for backward compatibility during migration)
 // ============================================================================

@@ -43,39 +43,6 @@ type Terminal struct {
 	mu          sync.Mutex
 }
 
-// Cell represents a single cell in the terminal grid
-type Cell struct {
-	Char          rune
-	FG            Color
-	BG            Color
-	Bold          bool
-	Italic        bool
-	Underline     bool
-	Strikethrough bool
-}
-
-// Color represents an RGB color
-type Color struct {
-	R, G, B uint8
-	Default bool
-}
-
-// CursorState represents the cursor position and visibility
-type CursorState struct {
-	X, Y    int
-	Visible bool
-	Style   CursorStyle
-}
-
-// CursorStyle represents cursor appearance
-type CursorStyle int
-
-const (
-	CursorBlock CursorStyle = iota
-	CursorUnderline
-	CursorBar
-)
-
 // New creates a new Terminal with the given dimensions
 func New(cols, rows int) (*Terminal, error) {
 	t := &Terminal{

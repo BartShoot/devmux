@@ -9,8 +9,12 @@ import (
 )
 
 // setProcessGroup sets the process to run in its own process group on Unix
+// and ensures it dies if the parent daemon dies.
 func setProcessGroup(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid:   true,
+		Pdeathsig: syscall.SIGKILL,
+	}
 }
 
 // killProcessTree kills the entire process tree on Unix using process groups
