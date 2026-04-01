@@ -8,6 +8,7 @@ type Request struct {
 	Command string `json:"command"`
 	Name    string `json:"name,omitempty"`
 	Offset  int    `json:"offset,omitempty"`
+	Tail    int    `json:"tail,omitempty"` // for "logs" command - return only last N lines
 	Input   string `json:"input,omitempty"` // for "input" command - data to send to process stdin
 }
 

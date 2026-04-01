@@ -228,7 +228,9 @@ func (s *Server) handleLegacyRequest(conn net.Conn, encoder *json.Encoder, req *
 				lines := p.Buffer.GetLines()
 				totalLines := len(lines)
 
-				if req.Offset < totalLines {
+				if req.Tail > 0 && req.Tail < totalLines {
+					lines = lines[totalLines-req.Tail:]
+				} else if req.Offset < totalLines {
 					lines = lines[req.Offset:]
 				} else if req.Offset > totalLines {
 					lines = lines[:]
