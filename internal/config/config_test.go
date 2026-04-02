@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -123,5 +124,152 @@ func TestResolveCwd(t *testing.T) {
 	expected = filepath.Join("tabdir", "panedir")
 	if filepath.ToSlash(cwd) != filepath.ToSlash(expected) {
 		t.Errorf("5. expected %s, got %s", expected, cwd)
+	}
+}
+
+func TestValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  Config
+		wantErr bool
+		errMsgs []string // substrings expected in error
+	}{
+		{
+			name:    "no tabs",
+			config:  Config{},
+			wantErr: true,
+			errMsgs: []string{"no tabs defined"},
+		},
+		{
+			name: "tab without name",
+			config: Config{Tabs: []Tab{
+				{Panes: []Pane{{Name: "p", Command: "ls"}}},
+			}},
+			wantErr: true,
+			errMsgs: []string{"missing name"},
+		},
+		{
+			name: "tab without panes",
+			config: Config{Tabs: []Tab{
+				{Name: "t"},
+			}},
+			wantErr: true,
+			errMsgs: []string{"no panes defined"},
+		},
+		{
+			name: "pane without name",
+			config: Config{Tabs: []Tab{
+				{Name: "t", Panes: []Pane{{Command: "ls"}}},
+			}},
+			wantErr: true,
+			errMsgs: []string{"missing name"},
+		},
+		{
+			name: "pane without command",
+			config: Config{Tabs: []Tab{
+				{Name: "t", Panes: []Pane{{Name: "p"}}},
+			}},
+			wantErr: true,
+			errMsgs: []string{"missing command"},
+		},
+		{
+			name: "duplicate pane names",
+			config: Config{Tabs: []Tab{
+				{Name: "t1", Panes: []Pane{{Name: "p", Command: "ls"}}},
+				{Name: "t2", Panes: []Pane{{Name: "p", Command: "ls"}}},
+			}},
+			wantErr: true,
+			errMsgs: []string{"duplicate pane name"},
+		},
+		{
+			name: "unknown health check type",
+			config: Config{Tabs: []Tab{
+				{Name: "t", Panes: []Pane{{Name: "p", Command: "ls", HealthCheck: HealthCheck{Type: "magic"}}}},
+			}},
+			wantErr: true,
+			errMsgs: []string{"unknown health check type"},
+		},
+		{
+			name: "http health check missing url",
+			config: Config{Tabs: []Tab{
+				{Name: "t", Panes: []Pane{{Name: "p", Command: "ls", HealthCheck: HealthCheck{Type: "http", Interval: time.Second, Timeout: time.Second}}}},
+			}},
+			wantErr: true,
+			errMsgs: []string{"requires url"},
+		},
+		{
+			name: "tcp health check missing address",
+			config: Config{Tabs: []Tab{
+				{Name: "t", Panes: []Pane{{Name: "p", Command: "ls", HealthCheck: HealthCheck{Type: "tcp", Interval: time.Second, Timeout: time.Second}}}},
+			}},
+			wantErr: true,
+			errMsgs: []string{"requires address"},
+		},
+		{
+			name: "regex health check missing pattern",
+			config: Config{Tabs: []Tab{
+				{Name: "t", Panes: []Pane{{Name: "p", Command: "ls", HealthCheck: HealthCheck{Type: "regex", Interval: time.Second, Timeout: time.Second}}}},
+			}},
+			wantErr: true,
+			errMsgs: []string{"requires pattern"},
+		},
+		{
+			name: "health check missing interval",
+			config: Config{Tabs: []Tab{
+				{Name: "t", Panes: []Pane{{Name: "p", Command: "ls", HealthCheck: HealthCheck{Type: "http", URL: "http://localhost", Timeout: time.Second}}}},
+			}},
+			wantErr: true,
+			errMsgs: []string{"interval must be positive"},
+		},
+		{
+			name: "multiple errors reported at once",
+			config: Config{Tabs: []Tab{
+				{Panes: []Pane{{}, {Name: "p"}}},
+			}},
+			wantErr: true,
+			errMsgs: []string{"missing name", "missing command"},
+		},
+		{
+			name: "valid minimal config",
+			config: Config{Tabs: []Tab{
+				{Name: "t", Panes: []Pane{{Name: "p", Command: "ls"}}},
+			}},
+			wantErr: false,
+		},
+		{
+			name: "valid config with health checks",
+			config: Config{Tabs: []Tab{
+				{Name: "t", Panes: []Pane{{Name: "p", Command: "ls", HealthCheck: HealthCheck{
+					Type: "http", URL: "http://localhost", Interval: time.Second, Timeout: 5 * time.Second,
+				}}}},
+			}},
+			wantErr: false,
+		},
+		{
+			name: "pane without health check is valid",
+			config: Config{Tabs: []Tab{
+				{Name: "t", Panes: []Pane{{Name: "p", Command: "ls"}}},
+			}},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.config.Validate()
+			if tt.wantErr && err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if err != nil {
+				for _, msg := range tt.errMsgs {
+					if !strings.Contains(err.Error(), msg) {
+						t.Errorf("error %q should contain %q", err.Error(), msg)
+					}
+				}
+			}
+		})
 	}
 }

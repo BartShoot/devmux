@@ -1,5 +1,7 @@
 # Build outputs
 bin/
+/devmux
+/devmuxd
 *.exe
 *.dylib
 

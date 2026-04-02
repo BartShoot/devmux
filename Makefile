@@ -28,7 +28,7 @@ LDFLAGS := -s -w
 
 # CGO flags for libghostty
 CGO_CFLAGS := -I$(CURDIR)/$(GHOSTTY_OUT)/include
-CGO_LDFLAGS := -L$(CURDIR)/$(GHOSTTY_OUT)/lib/linux -Wl,-rpath,$(CURDIR)/$(GHOSTTY_OUT)/lib/linux -lghostty-vt -lutil -lm
+CGO_LDFLAGS := -L$(CURDIR)/$(GHOSTTY_OUT)/lib/linux -Wl,-rpath,$$ORIGIN/../lib -Wl,-rpath,$$ORIGIN/lib -lghostty-vt -lutil -lm
 
 # Default target
 all: build

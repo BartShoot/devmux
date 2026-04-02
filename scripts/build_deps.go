@@ -16,14 +16,15 @@ var (
 )
 
 type buildTarget struct {
-	name   string
-	libDir string
-	check  string // file to check if already built
+	name     string
+	zigTarget string // zig -Dtarget value, empty for native
+	libDir   string
+	check    string // file to check if already built
 }
 
 var buildTargets = []buildTarget{
-	{"linux", filepath.Join(ghosttyOut, "lib", "linux"), "libghostty-vt.so"},
-	{"windows", filepath.Join(ghosttyOut, "lib", "windows"), "ghostty-vt.lib"},
+	{"linux", "x86_64-linux", filepath.Join(ghosttyOut, "lib", "linux"), "libghostty-vt.so"},
+	{"windows", "x86_64-windows", filepath.Join(ghosttyOut, "lib", "windows"), "ghostty-vt.lib"},
 }
 
 func main() {
@@ -48,7 +49,7 @@ func main() {
 			continue
 		}
 		fmt.Printf("  %s: building...\n", t.name)
-		args := []string{"build", "-Demit-lib-vt=true", "-Doptimize=ReleaseFast"}
+		args := []string{"build", "-Demit-lib-vt=true", "-Doptimize=ReleaseFast", "-Dtarget=" + t.zigTarget}
 		cmd := exec.Command("zig", args...)
 		cmd.Dir = ghosttySrc
 		cmd.Stdout = os.Stdout
@@ -86,11 +87,13 @@ func copyLibs(destLibDir string) {
 		}
 	}
 
-	// Copy headers (shared across targets)
+	// Copy headers (shared across targets, only once)
 	if entries, err := os.ReadDir(zigOutInclude); err == nil {
 		for _, e := range entries {
 			src := filepath.Join(zigOutInclude, e.Name())
 			dst := filepath.Join(includeDir, e.Name())
+			// Remove existing to avoid cp -r nesting dirs inside dirs
+			os.RemoveAll(dst)
 			cp := exec.Command("cp", "-r", src, dst)
 			cp.Run()
 		}

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -76,5 +77,92 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+
 	return &cfg, nil
+}
+
+// Validate checks the config for semantic errors and returns all problems found.
+func (c *Config) Validate() error {
+	var errs []string
+
+	if len(c.Tabs) == 0 {
+		return fmt.Errorf("config validation failed:\n  - no tabs defined")
+	}
+
+	paneNames := make(map[string]bool)
+
+	for i, tab := range c.Tabs {
+		prefix := fmt.Sprintf("tabs[%d]", i)
+		if tab.Name == "" {
+			errs = append(errs, fmt.Sprintf("%s: missing name", prefix))
+		} else {
+			prefix = fmt.Sprintf("tab %q", tab.Name)
+		}
+
+		if len(tab.Panes) == 0 {
+			errs = append(errs, fmt.Sprintf("%s: no panes defined", prefix))
+			continue
+		}
+
+		for j, pane := range tab.Panes {
+			pprefix := fmt.Sprintf("%s.panes[%d]", prefix, j)
+			if pane.Name == "" {
+				errs = append(errs, fmt.Sprintf("%s: missing name", pprefix))
+			} else {
+				pprefix = fmt.Sprintf("%s pane %q", prefix, pane.Name)
+				if paneNames[pane.Name] {
+					errs = append(errs, fmt.Sprintf("%s: duplicate pane name", pprefix))
+				}
+				paneNames[pane.Name] = true
+			}
+
+			if pane.Command == "" {
+				errs = append(errs, fmt.Sprintf("%s: missing command", pprefix))
+			}
+
+			if err := validateHealthCheck(pane.HealthCheck, pprefix); err != "" {
+				errs = append(errs, err)
+			}
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("config validation failed:\n  - %s", strings.Join(errs, "\n  - "))
+	}
+	return nil
+}
+
+func validateHealthCheck(hc HealthCheck, prefix string) string {
+	if hc.Type == "" {
+		return ""
+	}
+
+	switch hc.Type {
+	case "http":
+		if hc.URL == "" {
+			return fmt.Sprintf("%s: health check type %q requires url", prefix, hc.Type)
+		}
+	case "tcp":
+		if hc.Address == "" {
+			return fmt.Sprintf("%s: health check type %q requires address", prefix, hc.Type)
+		}
+	case "regex":
+		if hc.Pattern == "" {
+			return fmt.Sprintf("%s: health check type %q requires pattern", prefix, hc.Type)
+		}
+	default:
+		return fmt.Sprintf("%s: unknown health check type %q (must be http, tcp, or regex)", prefix, hc.Type)
+	}
+
+	if hc.Interval <= 0 {
+		return fmt.Sprintf("%s: health check interval must be positive", prefix)
+	}
+	if hc.Timeout <= 0 {
+		return fmt.Sprintf("%s: health check timeout must be positive", prefix)
+	}
+
+	return ""
 }
