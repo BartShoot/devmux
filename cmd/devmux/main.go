@@ -1,74 +1,112 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
+	"devmux/internal/config"
 	"devmux/internal/protocol"
 	"devmux/internal/tui"
 )
 
+const defaultConfigName = "devmux.yaml"
+
+const sampleConfig = `# devmux configuration
+# See https://github.com/BartShoot/devmux for documentation.
+
+# Global working directory (optional). Relative pane/tab cwds resolve against this.
+# cwd: /home/user/projects
+
+tabs:
+  - name: "app"
+    # layout: "split"  # "vertical" (default), "horizontal", or "split"
+    panes:
+      - name: "server"
+        command: "go run ./cmd/server"
+        # cwd: "backend"  # relative to tab or global cwd
+        health_check:
+          type: "http"
+          url: "http://localhost:8080/health"
+          interval: 5s
+          timeout: 30s
+
+      - name: "worker"
+        command: "go run ./cmd/worker"
+        health_check:
+          type: "tcp"
+          address: "localhost:9090"
+          interval: 5s
+          timeout: 30s
+
+  - name: "frontend"
+    panes:
+      - name: "dev-server"
+        command: "npm run dev"
+        health_check:
+          type: "regex"
+          pattern: "ready in \\d+ms"
+          interval: 2s
+          timeout: 60s
+`
+
+func printUsage() {
+	fmt.Println("Usage: devmux <command> [args]")
+	fmt.Println()
+	fmt.Println("Commands:")
+	fmt.Println("  init                   Create a sample devmux.yaml in the current directory")
+	fmt.Println("  start [config] [--ui]  Start the daemon (default config: devmux.yaml)")
+	fmt.Println("  stop                   Stop the daemon")
+	fmt.Println("  ui                     Open the TUI")
+	fmt.Println("  status [name]          Show process status (all or specific)")
+	fmt.Println("  restart <name> [--wait]  Restart a process (--wait waits for healthy)")
+	fmt.Println("  logs <name> [flags]    Show process logs")
+	fmt.Println("    --tail N             Show only last N lines")
+	fmt.Println("    --grep PATTERN       Filter lines containing PATTERN")
+	fmt.Println("    -A N                 Show N lines after each match")
+	fmt.Println("    -B N                 Show N lines before each match")
+	fmt.Println("    -C N                 Show N lines before and after each match")
+}
+
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: devmux <command> [args]")
-		fmt.Println("Commands:")
-		fmt.Println("  start                  Start the daemon")
-		fmt.Println("  stop                   Stop the daemon")
-		fmt.Println("  ui                     Open the TUI")
-		fmt.Println("  status [name]          Show process status (all or specific)")
-		fmt.Println("  restart <name> [--wait]  Restart a process (--wait waits for healthy)")
-		fmt.Println("  logs <name> [flags]    Show process logs")
-		fmt.Println("    --tail N             Show only last N lines")
-		fmt.Println("    --grep PATTERN       Filter lines containing PATTERN")
-		fmt.Println("    -A N                 Show N lines after each match")
-		fmt.Println("    -B N                 Show N lines before each match")
-		fmt.Println("    -C N                 Show N lines before and after each match")
+		printUsage()
 		os.Exit(1)
 	}
 
 	command := os.Args[1]
 
+	if command == "help" || command == "--help" || command == "-h" {
+		printUsage()
+		return
+	}
+
+	if command == "init" {
+		runInit()
+		return
+	}
+
 	if command == "start" {
-		config := "devmux.yaml"
-		if len(os.Args) > 2 {
-			config = os.Args[2]
-		}
-
-		if runtime.GOOS == "windows" {
-			// On Windows, use PowerShell to start the process in the background properly
-			buildCmd := exec.Command("go", "build", "-o", "bin/devmuxd.exe", "./cmd/devmuxd")
-			if err := buildCmd.Run(); err != nil {
-				log.Fatalf("Failed to build daemon: %v", err)
-			}
-
-			psCmd := fmt.Sprintf("Start-Process -NoNewWindow -FilePath \".\\bin\\devmuxd.exe\" -ArgumentList \"%s\"", config)
-			cmd := exec.Command("powershell", "-Command", psCmd)
-			if err := cmd.Run(); err != nil {
-				log.Fatalf("Failed to start daemon via PowerShell: %v", err)
-			}
-			fmt.Println("Daemon started in background.")
-		} else {
-			cmd := exec.Command("go", "run", "cmd/devmuxd/main.go", config)
-			if err := cmd.Start(); err != nil {
-				log.Fatalf("Failed to start daemon: %v", err)
-			}
-			fmt.Printf("Daemon started with PID %d\n", cmd.Process.Pid)
-		}
+		runStart()
 		return
 	}
 
 	if command == "ui" {
-		// Use streaming TUI (works without CGO)
 		ui := tui.NewStreamingTUI(protocol.GetSocketNetwork(), protocol.GetSocketPath())
 		if err := ui.Run(); err != nil {
+			if strings.Contains(err.Error(), "connect") || strings.Contains(err.Error(), "refused") {
+				fmt.Fprintf(os.Stderr, "Daemon is not running. Start it with: devmux start\n")
+				os.Exit(1)
+			}
 			log.Fatalf("UI error: %v", err)
 		}
 		return
@@ -80,7 +118,8 @@ func main() {
 			fmt.Println("Daemon is not running.")
 			return
 		}
-		log.Fatalf("Failed to connect to daemon: %v", err)
+		fmt.Fprintf(os.Stderr, "Daemon is not running. Start it with: devmux start\n")
+		os.Exit(1)
 	}
 	defer conn.Close()
 
@@ -214,6 +253,142 @@ func main() {
 			log.Fatalf("Failed waiting for healthy status: %v", err)
 		}
 		fmt.Printf("%s is now healthy\n", processName)
+	}
+}
+
+// runInit creates a sample devmux.yaml in the current directory.
+func runInit() {
+	if _, err := os.Stat(defaultConfigName); err == nil {
+		fmt.Fprintf(os.Stderr, "%s already exists. Remove it first or edit it directly.\n", defaultConfigName)
+		os.Exit(1)
+	}
+
+	if err := os.WriteFile(defaultConfigName, []byte(sampleConfig), 0o644); err != nil {
+		log.Fatalf("Failed to write %s: %v", defaultConfigName, err)
+	}
+	fmt.Printf("Created %s — edit it to match your project, then run: devmux start\n", defaultConfigName)
+}
+
+// runStart validates config, finds the daemon binary, launches it, and waits for it to be ready.
+func runStart() {
+	configPath := defaultConfigName
+	openUI := false
+	for _, arg := range os.Args[2:] {
+		if arg == "--ui" || arg == "-u" {
+			openUI = true
+		} else {
+			configPath = arg
+		}
+	}
+
+	// Check config exists and is valid before launching daemon
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "Config file %q not found.\n", configPath)
+		fmt.Fprintf(os.Stderr, "Create one with: devmux init\n")
+		os.Exit(1)
+	}
+
+	if _, err := config.Load(configPath); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+
+	daemonBin, err := findDaemonBinary()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+
+	// Resolve config to absolute path so daemon finds it regardless of cwd
+	absConfig, err := filepath.Abs(configPath)
+	if err != nil {
+		log.Fatalf("Failed to resolve config path: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	cmd := exec.Command(daemonBin, absConfig)
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to start daemon: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Wait for daemon socket to appear
+	if err := waitForDaemon(cmd, &stderr); err != nil {
+		fmt.Fprintf(os.Stderr, "Daemon failed to start: %v\n", err)
+		if stderr.Len() > 0 {
+			fmt.Fprintf(os.Stderr, "%s\n", strings.TrimSpace(stderr.String()))
+		}
+		os.Exit(1)
+	}
+
+	fmt.Printf("Daemon started (PID %d)\n", cmd.Process.Pid)
+
+	if openUI {
+		ui := tui.NewStreamingTUI(protocol.GetSocketNetwork(), protocol.GetSocketPath())
+		if err := ui.Run(); err != nil {
+			log.Fatalf("UI error: %v", err)
+		}
+	}
+}
+
+// findDaemonBinary locates the devmuxd binary.
+func findDaemonBinary() (string, error) {
+	binaryName := "devmuxd"
+	if runtime.GOOS == "windows" {
+		binaryName = "devmuxd.exe"
+	}
+
+	// Check next to the running devmux binary
+	self, err := os.Executable()
+	if err == nil {
+		sibling := filepath.Join(filepath.Dir(self), binaryName)
+		if _, err := os.Stat(sibling); err == nil {
+			return sibling, nil
+		}
+	}
+
+	// Check PATH
+	if path, err := exec.LookPath(binaryName); err == nil {
+		return path, nil
+	}
+
+	return "", fmt.Errorf("devmuxd not found. Ensure it's installed or on your PATH")
+}
+
+// waitForDaemon polls the socket until the daemon is reachable or the process exits.
+func waitForDaemon(cmd *exec.Cmd, stderr *bytes.Buffer) error {
+	network := protocol.GetSocketNetwork()
+	address := protocol.GetSocketPath()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+
+	deadline := time.After(5 * time.Second)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case err := <-done:
+			// Daemon exited before socket appeared
+			if err != nil {
+				return fmt.Errorf("process exited: %v", err)
+			}
+			return fmt.Errorf("process exited unexpectedly")
+		case <-deadline:
+			cmd.Process.Kill()
+			return fmt.Errorf("timed out waiting for daemon to start")
+		case <-ticker.C:
+			conn, err := net.DialTimeout(network, address, 50*time.Millisecond)
+			if err == nil {
+				conn.Close()
+				return nil
+			}
+		}
 	}
 }
 

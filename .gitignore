@@ -1,15 +1,20 @@
 # Build outputs
 bin/
+/devmux
+/devmuxd
 *.exe
-*.dll
-*.so
 *.dylib
 
 # Go
 *.test
 
-# Third party dependencies (built from source)
-third_party/
+# Third party - ignore source, keep built libraries
+third_party/ghostty-src/
+!third_party/ghostty/
+!third_party/ghostty/lib/
+!third_party/ghostty/lib/linux/
+!third_party/ghostty/lib/windows/
+!third_party/ghostty/include/
 
 # IDE
 .idea/
@@ -25,3 +30,5 @@ daemon.log
 # OS
 .DS_Store
 Thumbs.db
+# Added by goreleaser init:
+dist/

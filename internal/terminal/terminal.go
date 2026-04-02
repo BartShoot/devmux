@@ -4,7 +4,7 @@ package terminal
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../../third_party/ghostty/include
-#cgo LDFLAGS: -L${SRCDIR}/../../third_party/ghostty/lib -lghostty-vt -lutil -lm
+#cgo LDFLAGS: -L${SRCDIR}/../../third_party/ghostty/lib/linux -Wl,-rpath,$ORIGIN/../lib -Wl,-rpath,$ORIGIN/lib -lghostty-vt -lutil -lm
 
 #include <stdlib.h>
 #include <stdint.h>

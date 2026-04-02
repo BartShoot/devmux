@@ -34,7 +34,7 @@ function Ghostty-Fetch {
 }
 
 function Ghostty-Build {
-    if ((Test-Path "$GhosttyOut/lib/ghostty-vt.lib") -or (Test-Path "$GhosttyOut/lib/libghostty-vt.so")) {
+    if (Test-Path "$GhosttyOut/lib/windows/ghostty-vt.lib") {
         Write-Host "libghostty-vt already built"
         return
     }
@@ -43,17 +43,17 @@ function Ghostty-Build {
         return
     }
     Ghostty-Fetch
-    if (-not (Test-Path "$GhosttyOut/lib")) { New-Item -ItemType Directory -Path "$GhosttyOut/lib" -Force | Out-Null }
+    if (-not (Test-Path "$GhosttyOut/lib/windows")) { New-Item -ItemType Directory -Path "$GhosttyOut/lib/windows" -Force | Out-Null }
     if (-not (Test-Path "$GhosttyOut/include")) { New-Item -ItemType Directory -Path "$GhosttyOut/include" -Force | Out-Null }
-    
-    Write-Host "Building libghostty-vt..."
+
+    Write-Host "Building libghostty-vt for windows..."
     Push-Location $GhosttySrc
     zig build -Demit-lib-vt=true -Doptimize=ReleaseFast
     Pop-Location
-    
+
     Write-Host "Copying library files..."
-    Copy-Item "$GhosttySrc/zig-out/lib/*.lib" "$GhosttyOut/lib/" -ErrorAction SilentlyContinue
-    Copy-Item "$GhosttySrc/zig-out/bin/*.dll" "$GhosttyOut/lib/" -ErrorAction SilentlyContinue
+    Copy-Item "$GhosttySrc/zig-out/lib/*.lib" "$GhosttyOut/lib/windows/" -ErrorAction SilentlyContinue
+    Copy-Item "$GhosttySrc/zig-out/bin/*.dll" "$GhosttyOut/lib/windows/" -ErrorAction SilentlyContinue
     Copy-Item "$GhosttySrc/zig-out/bin/*.dll" "$BinDir/" -ErrorAction SilentlyContinue
     if (Test-Path "$GhosttySrc/zig-out/include") {
         if (Test-Path "$GhosttyOut/include/ghostty") { Remove-Item -Recurse -Force "$GhosttyOut/include/ghostty" }
