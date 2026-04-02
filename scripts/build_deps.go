@@ -23,7 +23,7 @@ type buildTarget struct {
 }
 
 var buildTargets = []buildTarget{
-	{"linux", "x86_64-linux", filepath.Join(ghosttyOut, "lib", "linux"), "libghostty-vt.so"},
+	{"linux", "", filepath.Join(ghosttyOut, "lib", "linux"), "libghostty-vt.so"},
 	{"windows", "x86_64-windows", filepath.Join(ghosttyOut, "lib", "windows"), "ghostty-vt.lib"},
 }
 
@@ -49,7 +49,10 @@ func main() {
 			continue
 		}
 		fmt.Printf("  %s: building...\n", t.name)
-		args := []string{"build", "-Demit-lib-vt=true", "-Doptimize=ReleaseFast", "-Dtarget=" + t.zigTarget}
+		args := []string{"build", "-Demit-lib-vt=true", "-Doptimize=ReleaseFast"}
+		if t.zigTarget != "" {
+			args = append(args, "-Dtarget="+t.zigTarget)
+		}
 		cmd := exec.Command("zig", args...)
 		cmd.Dir = ghosttySrc
 		cmd.Stdout = os.Stdout

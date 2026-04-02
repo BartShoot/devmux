@@ -1,9 +1,12 @@
 package tui
 
 import (
+	"encoding/base64"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"devmux/internal/protocol"
 
@@ -141,6 +144,7 @@ func (t *StreamingTUI) Run() error {
 		t.mu.Unlock()
 	})
 
+	t.app.EnableMouse(true)
 	t.app.SetRoot(mainFlex, true)
 	return t.app.Run()
 }
@@ -198,6 +202,7 @@ func (t *StreamingTUI) buildTabContent(tab protocol.TabInfo, tabViews *[]*Simple
 		tv := NewSimpleTerminalView(pane.ID, pane.Name)
 		tv.command = pane.Command
 		tv.running = pane.Running
+		tv.client = t.client
 		title := formatPaneTitle(pane.Name, pane.Running, pane.Status)
 		tv.SetTitle(title)
 		*tabViews = append(*tabViews, tv)
@@ -280,6 +285,12 @@ func (t *StreamingTUI) handleSelection(sel *protocol.SelectionMsg) {
 
 	if ok {
 		tv.UpdateSelection(sel)
+		// Copy selected text to system clipboard via OSC 52
+		if sel.Text != "" {
+			t.copyToClipboard(sel.Text)
+			lines := strings.Count(sel.Text, "\n") + 1
+			t.flashStatusBar(fmt.Sprintf("Copied %d lines", lines))
+		}
 		t.app.QueueUpdateDraw(func() {})
 	}
 }
@@ -683,4 +694,23 @@ func formatPaneTitle(name string, running bool, status string) string {
 	}
 
 	return fmt.Sprintf(" [%s]%s[-] %s ", color, indicator, name)
+}
+
+// copyToClipboard writes text to the system clipboard using the OSC 52 escape sequence.
+func (t *StreamingTUI) copyToClipboard(text string) {
+	encoded := base64.StdEncoding.EncodeToString([]byte(text))
+	// Write OSC 52 directly to the terminal — tview suspends normal stdout,
+	// so we write to the underlying tty.
+	fmt.Fprintf(os.Stderr, "\x1b]52;c;%s\x07", encoded)
+}
+
+// flashStatusBar briefly shows a message in the status bar, then restores the mode text.
+func (t *StreamingTUI) flashStatusBar(msg string) {
+	t.statusBar.SetText(fmt.Sprintf("[#1e1e2e:#f9e2af] %s [-:-]", msg))
+	go func() {
+		time.Sleep(2 * time.Second)
+		t.app.QueueUpdateDraw(func() {
+			t.updateStatusBar()
+		})
+	}()
 }
