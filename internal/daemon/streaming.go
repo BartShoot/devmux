@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"sync"
@@ -428,6 +429,33 @@ func (uc *UpdateCoalescer) MarkDirty(paneID protocol.PaneID) {
 	if uc.timer == nil {
 		uc.timer = time.AfterFunc(uc.interval, uc.flush)
 	}
+}
+
+// FlushPane synchronously flushes a single pane's screen state to all subscribers.
+// Uses forceReadScreenUpdate to bypass dirty tracking — ensures final output is sent
+// even if the coalescer already flushed recently.
+func (uc *UpdateCoalescer) FlushPane(paneID protocol.PaneID) {
+	// Remove from dirty set so the timer doesn't double-send
+	uc.mu.Lock()
+	delete(uc.dirty, paneID)
+	uc.mu.Unlock()
+
+	update := uc.server.forceReadScreenUpdate(paneID)
+	if update == nil {
+		fmt.Printf("[debug] FlushPane(%d): forceRead returned nil\n", paneID)
+		return
+	}
+	nonEmpty := 0
+	for _, c := range update.Cells {
+		if c.Char != 0 && c.Char != ' ' {
+			nonEmpty++
+		}
+	}
+	fmt.Printf("[debug] FlushPane(%d): sending %d cells (%d non-empty), seq=%d\n", paneID, len(update.Cells), nonEmpty, update.Sequence)
+	uc.server.clientManager.BroadcastToPane(paneID, &protocol.ServerMessage{
+		Type:         protocol.MsgScreenUpdate,
+		ScreenUpdate: update,
+	})
 }
 
 // flush materializes screen state for dirty panes and sends to subscribers.

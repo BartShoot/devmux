@@ -182,13 +182,24 @@ func (pm *ProcessManager) UpdateCommand(name, newCommand string) error {
 		return fmt.Errorf("process %s not found", name)
 	}
 	p.Command = newCommand
+	// Add to commands list if not already present (so dump preserves it)
+	found := false
+	for _, c := range p.Commands {
+		if c.Command == newCommand {
+			found = true
+			break
+		}
+	}
+	if !found {
+		p.Commands = append(p.Commands, config.CommandEntry{Command: newCommand})
+	}
 	wasRunning := p.Running
 	pm.mu.Unlock()
 
 	if wasRunning {
 		return pm.RestartProcess(name)
 	}
-	return nil
+	return pm.StartStopped(name)
 }
 
 func (pm *ProcessManager) StartProcessWithBuffer(name, command, cwd string, hcCfg config.HealthCheck, commands []config.CommandEntry, buffer *LogBuffer) error {
@@ -308,23 +319,35 @@ func (pm *ProcessManager) StartProcessWithBuffer(name, command, cwd string, hcCf
 			if stdin != nil {
 				stdin.Close()
 			}
-			if term != nil {
-				term.Close()
-			}
+
+			// Flush final screen state BEFORE closing terminal.
+			// Order: flush screen → close terminal → mark stopped → broadcast status.
 			pm.mu.Lock()
-			managed.Running = false
 			server := pm.server
 			pm.mu.Unlock()
 
-			// Flush final screen state and broadcast stopped status
 			if server != nil {
 				if cachedPaneID == 0 {
 					cachedPaneID = server.getPaneID(name)
 				}
 				if cachedPaneID != 0 {
-					server.coalescer.MarkDirty(cachedPaneID)
-					server.BroadcastPaneStatus(cachedPaneID, false, string(StatusUnhealthy))
+					fmt.Printf("[debug] %s: flushing final screen (pane %d, term=%v)\n", name, cachedPaneID, term != nil)
+					server.coalescer.FlushPane(cachedPaneID)
 				}
+			}
+
+			if term != nil {
+				term.Close()
+			}
+
+			pm.mu.Lock()
+			managed.Running = false
+			pm.mu.Unlock()
+
+			// Broadcast stopped status after screen flush
+			if server != nil && cachedPaneID != 0 {
+				fmt.Printf("[debug] %s: broadcasting stopped status\n", name)
+				server.BroadcastPaneStatus(cachedPaneID, false, string(StatusUnhealthy))
 			}
 		}()
 
