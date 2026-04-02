@@ -28,7 +28,7 @@ LDFLAGS := -s -w
 
 # CGO flags for libghostty
 CGO_CFLAGS := -I$(CURDIR)/$(GHOSTTY_OUT)/include
-CGO_LDFLAGS := -L$(CURDIR)/$(GHOSTTY_OUT)/lib -Wl,-rpath,$(CURDIR)/$(GHOSTTY_OUT)/lib -lghostty-vt -lutil -lm
+CGO_LDFLAGS := -L$(CURDIR)/$(GHOSTTY_OUT)/lib/linux -Wl,-rpath,$(CURDIR)/$(GHOSTTY_OUT)/lib/linux -lghostty-vt -lutil -lm
 
 # Default target
 all: build
@@ -74,12 +74,12 @@ ghostty-fetch:
 
 # Build libghostty-vt
 ghostty-build: check-zig ghostty-fetch
-	@mkdir -p $(GHOSTTY_OUT)/lib $(GHOSTTY_OUT)/include
-	@if [ ! -f "$(GHOSTTY_OUT)/lib/libghostty-vt.so" ] && [ ! -f "$(GHOSTTY_OUT)/lib/ghostty-vt.lib" ]; then \
-		echo "Building libghostty-vt..."; \
+	@mkdir -p $(GHOSTTY_OUT)/lib/linux $(GHOSTTY_OUT)/include
+	@if [ ! -f "$(GHOSTTY_OUT)/lib/linux/libghostty-vt.so" ]; then \
+		echo "Building libghostty-vt for linux..."; \
 		cd $(GHOSTTY_SRC) && zig build -Demit-lib-vt=true -Doptimize=ReleaseFast; \
 		echo "Copying library files..."; \
-		cp $(GHOSTTY_SRC)/zig-out/lib/libghostty-vt.* $(GHOSTTY_OUT)/lib/ 2>/dev/null || true; \
+		cp $(GHOSTTY_SRC)/zig-out/lib/libghostty-vt.* $(GHOSTTY_OUT)/lib/linux/ 2>/dev/null || true; \
 		cp -r $(GHOSTTY_SRC)/zig-out/include/* $(GHOSTTY_OUT)/include/ 2>/dev/null || \
 			cp $(GHOSTTY_SRC)/include/*.h $(GHOSTTY_OUT)/include/ 2>/dev/null || true; \
 	else \
