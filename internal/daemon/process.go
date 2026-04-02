@@ -146,8 +146,14 @@ func (pm *ProcessManager) StartStopped(name string) error {
 	cwd := p.Cwd
 	hcCfg := p.HCCfg
 	buffer := p.Buffer
+	oldTerm := p.Terminal
 	delete(pm.processes, name)
 	pm.mu.Unlock()
+
+	// Close the old terminal now that we're replacing it
+	if oldTerm != nil {
+		oldTerm.Close()
+	}
 
 	buffer.Clear()
 	return pm.StartProcessWithBuffer(name, command, cwd, hcCfg, commands, buffer)
@@ -336,9 +342,9 @@ func (pm *ProcessManager) StartProcessWithBuffer(name, command, cwd string, hcCf
 				}
 			}
 
-			if term != nil {
-				term.Close()
-			}
+			// Do NOT close terminal here — it holds the scrollback buffer
+			// and must remain readable for scrolling on stopped panes.
+			// Terminal is closed in StartStopped when a new process replaces it.
 
 			pm.mu.Lock()
 			managed.Running = false
@@ -431,6 +437,15 @@ func (pm *ProcessManager) StopAll() {
 	// Wait up to 2 seconds for ports to release
 	fmt.Println("Waiting for processes to release ports...")
 	time.Sleep(2 * time.Second)
+
+	// Close all terminals
+	pm.mu.Lock()
+	for _, p := range pm.processes {
+		if p.Terminal != nil {
+			p.Terminal.Close()
+		}
+	}
+	pm.mu.Unlock()
 }
 
 
