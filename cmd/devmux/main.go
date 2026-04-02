@@ -32,7 +32,10 @@ tabs:
     # layout: "split"  # "vertical" (default), "horizontal", or "split"
     panes:
       - name: "server"
-        command: "go run ./cmd/server"
+        # Commands list: first is default. Use labels for quick switching.
+        commands:
+          - normal: "go run ./cmd/server"
+          - debug: "go run ./cmd/server -debug"
         # cwd: "backend"  # relative to tab or global cwd
         health_check:
           type: "http"
@@ -41,7 +44,8 @@ tabs:
           timeout: 30s
 
       - name: "worker"
-        command: "go run ./cmd/worker"
+        commands:
+          - "go run ./cmd/worker"
         health_check:
           type: "tcp"
           address: "localhost:9090"
@@ -51,7 +55,8 @@ tabs:
   - name: "frontend"
     panes:
       - name: "dev-server"
-        command: "npm run dev"
+        commands:
+          - "npm run dev"
         health_check:
           type: "regex"
           pattern: "ready in \\d+ms"
@@ -69,6 +74,11 @@ func printUsage() {
 	fmt.Println("  ui                     Open the TUI")
 	fmt.Println("  status [name]          Show process status (all or specific)")
 	fmt.Println("  restart <name> [--wait]  Restart a process (--wait waits for healthy)")
+	fmt.Println("  update <name> --cmd CMD   Update command (auto-restarts if running)")
+	fmt.Println("  update <name> --preset P  Switch to preset by label or number")
+	fmt.Println("  presets <name>            List available command presets")
+	fmt.Println("  presets <name> --add CMD  Add a preset (--label NAME for optional label)")
+	fmt.Println("  dump                      Dump current running config as YAML to stdout")
 	fmt.Println("  logs <name> [flags]    Show process logs")
 	fmt.Println("    --tail N             Show only last N lines")
 	fmt.Println("    --grep PATTERN       Filter lines containing PATTERN")
@@ -123,14 +133,72 @@ func main() {
 	}
 	defer conn.Close()
 
-	// Parse arguments for restart command
+	// Parse arguments for commands
 	var processName string
 	var waitForHealthy bool
 	var tailN int
 	var grepPattern string
 	var ctxAfter, ctxBefore int
+	var newCommand string
+	var preset string
+	var addPreset string
+	var presetLabel string
 
 	switch command {
+	case "update":
+		args := os.Args[2:]
+		for i := 0; i < len(args); i++ {
+			switch args[i] {
+			case "--cmd":
+				i++
+				if i >= len(args) {
+					log.Fatal("--cmd requires a value")
+				}
+				newCommand = args[i]
+			case "--preset":
+				i++
+				if i >= len(args) {
+					log.Fatal("--preset requires a value")
+				}
+				preset = args[i]
+			default:
+				if !strings.HasPrefix(args[i], "-") {
+					processName = args[i]
+				} else {
+					log.Fatalf("Unknown flag: %s", args[i])
+				}
+			}
+		}
+		if processName == "" || (newCommand == "" && preset == "") {
+			log.Fatal("Usage: devmux update <name> --cmd \"command\" | --preset <label|number>")
+		}
+	case "presets":
+		args := os.Args[2:]
+		for i := 0; i < len(args); i++ {
+			switch args[i] {
+			case "--add":
+				i++
+				if i >= len(args) {
+					log.Fatal("--add requires a value")
+				}
+				addPreset = args[i]
+			case "--label":
+				i++
+				if i >= len(args) {
+					log.Fatal("--label requires a value")
+				}
+				presetLabel = args[i]
+			default:
+				if !strings.HasPrefix(args[i], "-") {
+					processName = args[i]
+				} else {
+					log.Fatalf("Unknown flag: %s", args[i])
+				}
+			}
+		}
+		if processName == "" {
+			log.Fatal("Usage: devmux presets <name> [--add \"cmd\" [--label NAME]]")
+		}
 	case "restart":
 		for _, arg := range os.Args[2:] {
 			if arg == "--wait" || arg == "-w" {
@@ -210,7 +278,15 @@ func main() {
 		}
 	}
 
-	req := protocol.Request{Command: command, Name: processName, Tail: tailN}
+	req := protocol.Request{
+		Command:     command,
+		Name:        processName,
+		Tail:        tailN,
+		NewCommand:  newCommand,
+		Preset:      preset,
+		AddPreset:   addPreset,
+		PresetLabel: presetLabel,
+	}
 	if command == "stop" {
 		req.Command = "shutdown"
 	}
@@ -242,6 +318,16 @@ func main() {
 			log.Fatalf("Process %s not found", processName)
 		}
 		resp.Message = filtered
+	}
+
+	// For dump, print raw YAML output without status prefix
+	if command == "dump" {
+		if resp.Status != "ok" {
+			fmt.Fprintf(os.Stderr, "Error: %s\n", resp.Message)
+			os.Exit(1)
+		}
+		fmt.Print(resp.Message)
+		return
 	}
 
 	fmt.Printf("%s: %s\n", resp.Status, resp.Message)

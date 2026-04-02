@@ -191,3 +191,16 @@ func (c *StreamClient) SendProcessControl(paneID protocol.PaneID, action protoco
 		},
 	})
 }
+
+func (c *StreamClient) SendUpdateCommand(paneID protocol.PaneID, command string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.writer.WriteClientMessage(&protocol.ClientMessage{
+		Type: protocol.MsgProcessControl,
+		ProcessControl: &protocol.ProcessControlMsg{
+			PaneID:  paneID,
+			Action:  protocol.ProcessUpdateCommand,
+			Command: command,
+		},
+	})
+}

@@ -50,11 +50,72 @@ func (c *Config) ResolveCwd(tab *Tab, pane *Pane) string {
 	return baseCwd
 }
 
+// CommandEntry represents a single command preset with an optional label.
+type CommandEntry struct {
+	Label   string `yaml:"-"`
+	Command string `yaml:"-"`
+}
+
+// MarshalYAML encodes a CommandEntry as either a plain string or a single-key map.
+func (c CommandEntry) MarshalYAML() (interface{}, error) {
+	if c.Label == "" {
+		return c.Command, nil
+	}
+	return map[string]string{c.Label: c.Command}, nil
+}
+
 type Pane struct {
-	Name        string      `yaml:"name"`
-	Command     string      `yaml:"command"`
-	Cwd         string      `yaml:"cwd,omitempty"`
-	HealthCheck HealthCheck `yaml:"health_check,omitempty"`
+	Name        string         `yaml:"name"`
+	Commands    []CommandEntry `yaml:"commands"`
+	Cwd         string         `yaml:"cwd,omitempty"`
+	HealthCheck HealthCheck    `yaml:"health_check,omitempty"`
+}
+
+// UnmarshalYAML handles the mixed commands list: plain strings and single-key maps.
+func (p *Pane) UnmarshalYAML(value *yaml.Node) error {
+	// Decode into a raw struct to get all other fields
+	var raw struct {
+		Name        string      `yaml:"name"`
+		Cwd         string      `yaml:"cwd,omitempty"`
+		HealthCheck HealthCheck `yaml:"health_check,omitempty"`
+	}
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+	p.Name = raw.Name
+	p.Cwd = raw.Cwd
+	p.HealthCheck = raw.HealthCheck
+
+	// Find the "commands" key in the mapping
+	for i := 0; i < len(value.Content)-1; i += 2 {
+		if value.Content[i].Value == "commands" {
+			seqNode := value.Content[i+1]
+			if seqNode.Kind != yaml.SequenceNode {
+				return fmt.Errorf("commands must be a list")
+			}
+			for _, item := range seqNode.Content {
+				switch item.Kind {
+				case yaml.ScalarNode:
+					// Plain string: "gradle bootrun"
+					p.Commands = append(p.Commands, CommandEntry{Command: item.Value})
+				case yaml.MappingNode:
+					// Single-key map: debug: "mvnDebug exec:java"
+					if len(item.Content) != 2 {
+						return fmt.Errorf("command map entry must have exactly one key")
+					}
+					p.Commands = append(p.Commands, CommandEntry{
+						Label:   item.Content[0].Value,
+						Command: item.Content[1].Value,
+					})
+				default:
+					return fmt.Errorf("unexpected node type in commands list")
+				}
+			}
+			break
+		}
+	}
+
+	return nil
 }
 
 type HealthCheck struct {
@@ -119,8 +180,13 @@ func (c *Config) Validate() error {
 				paneNames[pane.Name] = true
 			}
 
-			if pane.Command == "" {
-				errs = append(errs, fmt.Sprintf("%s: missing command", pprefix))
+			if len(pane.Commands) == 0 {
+				errs = append(errs, fmt.Sprintf("%s: missing commands", pprefix))
+			}
+			for k, cmd := range pane.Commands {
+				if cmd.Command == "" {
+					errs = append(errs, fmt.Sprintf("%s commands[%d]: empty command", pprefix, k))
+				}
 			}
 
 			if err := validateHealthCheck(pane.HealthCheck, pprefix); err != "" {

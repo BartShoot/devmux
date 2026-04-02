@@ -8,7 +8,9 @@ tabs:
     panes:
       - name: "app-server"
         cwd: "backend-v4/application-server"
-        command: "mvn exec:java -Djdk.tls.useExtendedMasterSecret=false"
+        commands:
+          - normal: "mvn exec:java -Djdk.tls.useExtendedMasterSecret=false"
+          - debug: "mvnDebug exec:java -Djdk.tls.useExtendedMasterSecret=false"
         health_check:
           type: "http"
           url: "http://localhost:9090/services/internalAPI/getAppInfo"
@@ -17,7 +19,8 @@ tabs:
 
       - name: "git-server"
         cwd: "backend-v4/git-server"
-        command: "mvn exec:java"
+        commands:
+          - "mvn exec:java"
         health_check:
           type: "tcp"
           address: "localhost:9418"
@@ -26,7 +29,8 @@ tabs:
 
       - name: "build-server"
         cwd: "backend-v4/build-rmi-server"
-        command: "sudo /usr/bin/mvn exec:java -Dmaven.repo.local=/home/bartshoot/.m2/repository -gs /home/bartshoot/.m2/settings.xml"
+        commands:
+          - "sudo /usr/bin/mvn exec:java -Dmaven.repo.local=/home/bartshoot/.m2/repository -gs /home/bartshoot/.m2/settings.xml"
         health_check:
           type: "regex"
           pattern: "RMI server started"
@@ -37,7 +41,8 @@ tabs:
     panes:
       - name: "qik-backend"
         cwd: "registry"
-        command: "gradle bootrun"
+        commands:
+          - "gradle bootrun"
         health_check:
           type: "http"
           url: "http://localhost:8081/actuator/health"
@@ -48,7 +53,8 @@ tabs:
     panes:
       - name: "frontend"
         cwd: "frontend-v4"
-        command: "./build backend && dev/start.sh -b -m bartd"
+        commands:
+          - "./build backend && dev/start.sh -b -m bartd"
         health_check:
           type: "regex"
           pattern: "VITE v.* ready|webpack compiled|dev server running"

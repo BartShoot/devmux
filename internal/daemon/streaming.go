@@ -365,6 +365,8 @@ func (c *StreamingClient) handleProcessControl(msg *protocol.ProcessControlMsg) 
 		err = c.server.pm.StartStopped(name)
 	case protocol.ProcessRestart:
 		err = c.server.pm.RestartProcess(name)
+	case protocol.ProcessUpdateCommand:
+		err = c.server.pm.UpdateCommand(name, msg.Command)
 	}
 
 	if err != nil {

@@ -84,7 +84,8 @@ func (pm *ProcessManager) RunHealthChecks(ctx context.Context) {
 
 type ManagedProcess struct {
 	Name          string
-	Command       string
+	Command       string                // currently active command
+	Commands      []config.CommandEntry  // available command presets
 	Cwd           string
 	PTY           *os.File
 	Stdin         io.WriteCloser
@@ -141,6 +142,7 @@ func (pm *ProcessManager) StartStopped(name string) error {
 		return fmt.Errorf("process %s is already running", name)
 	}
 	command := p.Command
+	commands := p.Commands
 	cwd := p.Cwd
 	hcCfg := p.HCCfg
 	buffer := p.Buffer
@@ -148,7 +150,7 @@ func (pm *ProcessManager) StartStopped(name string) error {
 	pm.mu.Unlock()
 
 	buffer.Clear()
-	return pm.StartProcessWithBuffer(name, command, cwd, hcCfg, buffer)
+	return pm.StartProcessWithBuffer(name, command, cwd, hcCfg, commands, buffer)
 }
 
 func (pm *ProcessManager) RestartProcess(name string) error {
@@ -169,7 +171,27 @@ func (pm *ProcessManager) RestartProcess(name string) error {
 	return pm.StartStopped(name)
 }
 
-func (pm *ProcessManager) StartProcessWithBuffer(name, command, cwd string, hcCfg config.HealthCheck, buffer *LogBuffer) error {
+// UpdateCommand changes the command for a process.
+// If the process is running, it is automatically restarted with the new command.
+// If stopped, the stored command is updated for the next start.
+func (pm *ProcessManager) UpdateCommand(name, newCommand string) error {
+	pm.mu.Lock()
+	p, exists := pm.processes[name]
+	if !exists {
+		pm.mu.Unlock()
+		return fmt.Errorf("process %s not found", name)
+	}
+	p.Command = newCommand
+	wasRunning := p.Running
+	pm.mu.Unlock()
+
+	if wasRunning {
+		return pm.RestartProcess(name)
+	}
+	return nil
+}
+
+func (pm *ProcessManager) StartProcessWithBuffer(name, command, cwd string, hcCfg config.HealthCheck, commands []config.CommandEntry, buffer *LogBuffer) error {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
@@ -255,6 +277,7 @@ func (pm *ProcessManager) StartProcessWithBuffer(name, command, cwd string, hcCf
 	managed := &ManagedProcess{
 		Name:          name,
 		Command:       command,
+		Commands:      commands,
 		Cwd:           cwd,
 		PTY:           nil,
 		Stdin:         stdin,
@@ -290,7 +313,19 @@ func (pm *ProcessManager) StartProcessWithBuffer(name, command, cwd string, hcCf
 			}
 			pm.mu.Lock()
 			managed.Running = false
+			server := pm.server
 			pm.mu.Unlock()
+
+			// Flush final screen state and broadcast stopped status
+			if server != nil {
+				if cachedPaneID == 0 {
+					cachedPaneID = server.getPaneID(name)
+				}
+				if cachedPaneID != 0 {
+					server.coalescer.MarkDirty(cachedPaneID)
+					server.BroadcastPaneStatus(cachedPaneID, false, string(StatusUnhealthy))
+				}
+			}
 		}()
 
 		// Read output and feed to buffer, terminal, and subscribers
@@ -347,8 +382,8 @@ func (pm *ProcessManager) StartProcessWithBuffer(name, command, cwd string, hcCf
 	return nil
 }
 
-func (pm *ProcessManager) StartProcess(name, command, cwd string, hcCfg config.HealthCheck) error {
-	return pm.StartProcessWithBuffer(name, command, cwd, hcCfg, NewLogBuffer(1000))
+func (pm *ProcessManager) StartProcess(name, command, cwd string, hcCfg config.HealthCheck, commands []config.CommandEntry) error {
+	return pm.StartProcessWithBuffer(name, command, cwd, hcCfg, commands, NewLogBuffer(1000))
 }
 
 func (pm *ProcessManager) StopAll() {

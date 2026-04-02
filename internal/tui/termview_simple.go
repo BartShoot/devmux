@@ -16,7 +16,8 @@ type SimpleTerminalView struct {
 	*tview.Box
 	paneID    protocol.PaneID
 	name      string
-	command   string // process command (for display in overlay)
+	command   string              // currently active command (for display in overlay)
+	commands  []protocol.PaneCommand // available command presets
 	cells     []protocol.CellData
 	cols      int // terminal cols from daemon
 	rows      int // terminal rows from daemon

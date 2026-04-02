@@ -20,12 +20,15 @@ type InputMode uint8
 const (
 	ModeNormal InputMode = iota
 	ModeInsert
+	ModeCommandPicker
+	ModeCustomCommand
 )
 
 // StreamingTUI is the new TUI using push-based streaming protocol
 type StreamingTUI struct {
 	app       *tview.Application
 	pages     *tview.Pages
+	rootPages *tview.Pages // wraps main layout, hosts modal overlays
 	tabBar    *tview.TextView
 	statusBar *tview.TextView
 	client    *StreamClient
@@ -34,6 +37,9 @@ type StreamingTUI struct {
 
 	// Input mode
 	mode InputMode
+
+	// Command picker state
+	pickerPaneID protocol.PaneID
 
 	// Pane management (global registry)
 	panes map[protocol.PaneID]*SimpleTerminalView
@@ -124,6 +130,10 @@ func (t *StreamingTUI) Run() error {
 		AddItem(t.statusBar, 1, 0, false)
 	mainFlex.SetBackgroundColor(colBase)
 
+	// Root pages: main layout + modal overlays
+	t.rootPages = tview.NewPages()
+	t.rootPages.AddPage("main", mainFlex, true, true)
+
 	// Global input handling
 	t.app.SetInputCapture(t.handleInput)
 
@@ -145,7 +155,7 @@ func (t *StreamingTUI) Run() error {
 	})
 
 	t.app.EnableMouse(true)
-	t.app.SetRoot(mainFlex, true)
+	t.app.SetRoot(t.rootPages, true)
 	return t.app.Run()
 }
 
@@ -201,9 +211,10 @@ func (t *StreamingTUI) buildTabContent(tab protocol.TabInfo, tabViews *[]*Simple
 	for _, pane := range tab.Panes {
 		tv := NewSimpleTerminalView(pane.ID, pane.Name)
 		tv.command = pane.Command
+		tv.commands = pane.Commands
 		tv.running = pane.Running
 		tv.client = t.client
-		title := formatPaneTitle(pane.Name, pane.Running, pane.Status)
+		title := formatPaneTitle(pane.Name, pane.Command, pane.Running, pane.Status)
 		tv.SetTitle(title)
 		*tabViews = append(*tabViews, tv)
 		t.panes[pane.ID] = tv
@@ -307,7 +318,10 @@ func (t *StreamingTUI) handlePaneStatus(status *protocol.PaneStatusMsg) {
 		tv.mu.Unlock()
 
 		t.app.QueueUpdateDraw(func() {
-			title := formatPaneTitle(tv.name, status.Running, status.Status)
+			tv.mu.RLock()
+			cmd := tv.command
+			tv.mu.RUnlock()
+			title := formatPaneTitle(tv.name, cmd, status.Running, status.Status)
 			tv.SetTitle(title)
 		})
 	}
@@ -315,7 +329,9 @@ func (t *StreamingTUI) handlePaneStatus(status *protocol.PaneStatusMsg) {
 
 // handleError processes error messages
 func (t *StreamingTUI) handleError(err *protocol.ErrorMsg) {
-	fmt.Printf("Error from daemon: %s\n", err.Message)
+	t.app.QueueUpdateDraw(func() {
+		t.flashStatusBar(fmt.Sprintf("Error: %s", err.Message))
+	})
 }
 
 // currentTabPanes returns the pane views for the currently active tab
@@ -337,6 +353,9 @@ func (t *StreamingTUI) handleInput(event *tcell.EventKey) *tcell.EventKey {
 		return t.handleNormalMode(event)
 	case ModeInsert:
 		return t.handleInsertMode(event)
+	case ModeCommandPicker, ModeCustomCommand:
+		// Modal handles its own input via tview focus
+		return event
 	}
 	return event
 }
@@ -380,6 +399,11 @@ func (t *StreamingTUI) handleNormalMode(event *tcell.EventKey) *tcell.EventKey {
 
 	case event.Key() == tcell.KeyCtrlR:
 		t.processControlFocused(protocol.ProcessRestart)
+		return nil
+
+	// Edit command
+	case event.Rune() == 'e':
+		t.showCommandPicker()
 		return nil
 
 	// Scrolling
@@ -647,9 +671,12 @@ func (t *StreamingTUI) updateStatusBar() {
 
 	switch mode {
 	case ModeNormal:
-		t.statusBar.SetText("[#1e1e2e:#89b4fa] -- NORMAL -- [-:-]  [#6c7086]hjkl:focus  1-9:tab  i:insert  ^U/^D:scroll  ^C:stop  Enter:start  ^R:restart  q:quit[-]")
+		t.statusBar.SetText("[#1e1e2e:#89b4fa] -- NORMAL -- [-:-]  [#6c7086]hjkl:focus  1-9:tab  i:insert  e:edit-cmd  ^U/^D:scroll  ^C:stop  Enter:start  ^R:restart  q:quit[-]")
 	case ModeInsert:
 		t.statusBar.SetText("[#1e1e2e:#a6e3a1] -- INSERT -- [-:-]  [#6c7086]Esc:normal  (all input forwarded to process)[-]")
+	case ModeCommandPicker, ModeCustomCommand:
+		// Status bar just shows mode indicator while modal is open
+		t.statusBar.SetText("[#1e1e2e:#fab387] -- EDIT CMD -- [-:-]  [#6c7086]Esc:cancel[-]")
 	}
 }
 
@@ -668,8 +695,8 @@ func (t *StreamingTUI) updateFocus() {
 	}
 }
 
-// formatPaneTitle creates a title with status indicator using Catppuccin colors
-func formatPaneTitle(name string, running bool, status string) string {
+// formatPaneTitle creates a title with status indicator and command using Catppuccin colors
+func formatPaneTitle(name, command string, running bool, status string) string {
 	var indicator string
 	var color string
 
@@ -693,7 +720,12 @@ func formatPaneTitle(name string, running bool, status string) string {
 		}
 	}
 
-	return fmt.Sprintf(" [%s]%s[-] %s ", color, indicator, name)
+	cmdDisplay := command
+	if len(cmdDisplay) > 50 {
+		cmdDisplay = cmdDisplay[:47] + "..."
+	}
+
+	return fmt.Sprintf(" [%s]%s[-] %s: [#6c7086]%s[-] ", color, indicator, name, cmdDisplay)
 }
 
 // copyToClipboard writes text to the system clipboard using the OSC 52 escape sequence.
@@ -713,4 +745,203 @@ func (t *StreamingTUI) flashStatusBar(msg string) {
 			t.updateStatusBar()
 		})
 	}()
+}
+
+// showCommandPicker opens a modal command picker for the focused pane.
+func (t *StreamingTUI) showCommandPicker() {
+	t.mu.Lock()
+	panes := t.currentTabPanes()
+	if t.focusIndex >= len(panes) {
+		t.mu.Unlock()
+		return
+	}
+	tv := panes[t.focusIndex]
+	tv.mu.RLock()
+	paneID := tv.paneID
+	paneName := tv.name
+	commands := tv.commands
+	currentCmd := tv.command
+	tv.mu.RUnlock()
+
+	if len(commands) == 0 {
+		t.mu.Unlock()
+		t.flashStatusBar("No command presets configured for this pane")
+		return
+	}
+
+	t.mode = ModeCommandPicker
+	t.pickerPaneID = paneID
+	t.mu.Unlock()
+
+	// Build the modal UI
+	preview := tview.NewTextView().
+		SetDynamicColors(true).
+		SetTextAlign(tview.AlignLeft)
+	preview.SetBackgroundColor(colSurface0)
+	preview.SetTextColor(colSubtext0)
+
+	customInput := tview.NewInputField().
+		SetLabel("c. Custom: ").
+		SetFieldBackgroundColor(colSurface0).
+		SetFieldTextColor(colText).
+		SetLabelColor(colText)
+
+	list := tview.NewList().
+		SetHighlightFullLine(true).
+		SetSelectedBackgroundColor(colSurface1).
+		SetSelectedTextColor(colLavender).
+		SetMainTextColor(colText).
+		SetSecondaryTextColor(colSubtext0)
+	list.SetBackgroundColor(colSurface0)
+	list.ShowSecondaryText(false)
+
+	// closeModal is the shared cleanup function
+	closeModal := func() {
+		t.mu.Lock()
+		t.mode = ModeNormal
+		t.mu.Unlock()
+		t.rootPages.RemovePage("cmd-picker")
+		t.updateStatusBar()
+	}
+
+	// applyCommand sends the update and closes
+	applyCommand := func(newCmd string) {
+		t.mu.Lock()
+		pid := t.pickerPaneID
+		tvv, ok := t.panes[pid]
+		if ok {
+			tvv.mu.Lock()
+			tvv.command = newCmd
+			tvv.mu.Unlock()
+		}
+		t.mode = ModeNormal
+		t.mu.Unlock()
+
+		t.rootPages.RemovePage("cmd-picker")
+		t.client.SendUpdateCommand(pid, newCmd)
+		t.updateStatusBar()
+		t.flashStatusBar("Command updated")
+	}
+
+	// Add preset items
+	initialSelect := 0
+	for i, cmd := range commands {
+		label := cmd.Command
+		if cmd.Label != "" {
+			label = cmd.Label
+		}
+		active := ""
+		if cmd.Command == currentCmd {
+			active = " [*]"
+			initialSelect = i
+		}
+		shortcut := rune('1' + i)
+		if i >= 9 {
+			shortcut = 0
+		}
+		cmdCopy := cmd.Command
+		list.AddItem(fmt.Sprintf("%s%s", label, active), cmdCopy, shortcut, func() {
+			applyCommand(cmdCopy)
+		})
+	}
+
+	// Update preview when selection changes
+	list.SetChangedFunc(func(index int, mainText, secondaryText string, shortcut rune) {
+		if index < len(commands) {
+			preview.SetText(fmt.Sprintf(" [#6c7086]>[-] %s", commands[index].Command))
+		} else {
+			preview.SetText("")
+		}
+	})
+
+	list.SetCurrentItem(initialSelect)
+	// Trigger initial preview
+	if initialSelect < len(commands) {
+		preview.SetText(fmt.Sprintf(" [#6c7086]>[-] %s", commands[initialSelect].Command))
+	}
+
+	// Custom input: Enter applies, Esc goes back to list
+	customInput.SetDoneFunc(func(key tcell.Key) {
+		switch key {
+		case tcell.KeyEnter:
+			text := customInput.GetText()
+			if text != "" {
+				applyCommand(text)
+			}
+		case tcell.KeyEscape:
+			t.mu.Lock()
+			t.mode = ModeCommandPicker
+			t.mu.Unlock()
+			t.app.SetFocus(list)
+		}
+	})
+
+	// List input: Esc closes, 'c' or navigating past last item activates custom input
+	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch {
+		case event.Key() == tcell.KeyEscape:
+			closeModal()
+			return nil
+		case event.Rune() == 'c':
+			t.mu.Lock()
+			t.mode = ModeCustomCommand
+			t.mu.Unlock()
+			t.app.SetFocus(customInput)
+			return nil
+		case (event.Rune() == 'j' || event.Key() == tcell.KeyDown) && list.GetCurrentItem() == list.GetItemCount()-1:
+			// At bottom of list, move to custom input
+			t.mu.Lock()
+			t.mode = ModeCustomCommand
+			t.mu.Unlock()
+			t.app.SetFocus(customInput)
+			preview.SetText("")
+			return nil
+		}
+		return event
+	})
+
+	// Custom input capture: up arrow goes back to list
+	customInput.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyUp {
+			t.mu.Lock()
+			t.mode = ModeCommandPicker
+			t.mu.Unlock()
+			t.app.SetFocus(list)
+			// Restore preview for current list selection
+			idx := list.GetCurrentItem()
+			if idx < len(commands) {
+				preview.SetText(fmt.Sprintf(" [#6c7086]>[-] %s", commands[idx].Command))
+			}
+			return nil
+		}
+		return event
+	})
+
+	// Build modal layout
+	modalContent := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(list, 0, 1, true).
+		AddItem(customInput, 1, 0, false).
+		AddItem(preview, 1, 0, false)
+	modalContent.SetBackgroundColor(colSurface0)
+	modalContent.SetBorder(true).
+		SetTitle(fmt.Sprintf(" Command: %s ", paneName)).
+		SetTitleColor(colLavender).
+		SetBorderColor(colOverlay0)
+
+	// Center the modal
+	modalHeight := len(commands) + 5 // items + custom + preview + borders
+	if modalHeight > 15 {
+		modalHeight = 15
+	}
+	modal := tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(modalContent, modalHeight, 0, true).
+			AddItem(nil, 0, 1, false), 60, 0, true).
+		AddItem(nil, 0, 1, false)
+
+	t.rootPages.AddPage("cmd-picker", modal, true, true)
+	t.app.SetFocus(list)
+	t.updateStatusBar()
 }

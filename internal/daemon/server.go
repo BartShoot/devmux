@@ -6,11 +6,15 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 
+	"devmux/internal/config"
 	"devmux/internal/protocol"
 	"devmux/internal/terminal"
+	"gopkg.in/yaml.v3"
 )
 
 type Server struct {
@@ -249,6 +253,79 @@ func (s *Server) handleLegacyRequest(conn net.Conn, encoder *json.Encoder, req *
 				resp = protocol.Response{Status: "ok", Message: "input sent"}
 			}
 		}
+	case "update":
+		if req.Name == "" {
+			resp = protocol.Response{Status: "error", Message: "process name is required for update"}
+		} else if req.Preset != "" {
+			// Resolve preset by label or index
+			newCmd, err := s.resolvePreset(req.Name, req.Preset)
+			if err != nil {
+				resp = protocol.Response{Status: "error", Message: err.Error()}
+			} else if err := s.pm.UpdateCommand(req.Name, newCmd); err != nil {
+				resp = protocol.Response{Status: "error", Message: fmt.Sprintf("failed to update process: %v", err)}
+			} else {
+				resp = protocol.Response{Status: "ok", Message: fmt.Sprintf("process %s updated to: %s", req.Name, newCmd)}
+			}
+		} else if req.NewCommand != "" {
+			if err := s.pm.UpdateCommand(req.Name, req.NewCommand); err != nil {
+				resp = protocol.Response{Status: "error", Message: fmt.Sprintf("failed to update process: %v", err)}
+			} else {
+				resp = protocol.Response{Status: "ok", Message: fmt.Sprintf("process %s updated", req.Name)}
+			}
+		} else {
+			resp = protocol.Response{Status: "error", Message: "either --cmd or --preset is required for update"}
+		}
+	case "presets":
+		if req.Name == "" {
+			resp = protocol.Response{Status: "error", Message: "process name is required for presets"}
+		} else if req.AddPreset != "" {
+			// Add a new preset
+			s.pm.mu.Lock()
+			p, exists := s.pm.processes[req.Name]
+			if !exists {
+				s.pm.mu.Unlock()
+				resp = protocol.Response{Status: "error", Message: fmt.Sprintf("process %s not found", req.Name)}
+			} else {
+				p.Commands = append(p.Commands, config.CommandEntry{Label: req.PresetLabel, Command: req.AddPreset})
+				s.pm.mu.Unlock()
+				resp = protocol.Response{Status: "ok", Message: fmt.Sprintf("preset added to %s", req.Name)}
+			}
+		} else {
+			// List presets
+			s.pm.mu.Lock()
+			p, exists := s.pm.processes[req.Name]
+			if !exists {
+				s.pm.mu.Unlock()
+				resp = protocol.Response{Status: "error", Message: fmt.Sprintf("process %s not found", req.Name)}
+			} else {
+				var lines []string
+				for i, cmd := range p.Commands {
+					active := ""
+					if cmd.Command == p.Command {
+						active = " [*]"
+					}
+					if cmd.Label != "" {
+						lines = append(lines, fmt.Sprintf("  %d. %s: %s%s", i+1, cmd.Label, cmd.Command, active))
+					} else {
+						lines = append(lines, fmt.Sprintf("  %d. %s%s", i+1, cmd.Command, active))
+					}
+				}
+				s.pm.mu.Unlock()
+				if len(lines) == 0 {
+					resp = protocol.Response{Status: "ok", Message: "no presets configured"}
+				} else {
+					resp = protocol.Response{Status: "ok", Message: strings.Join(lines, "\n")}
+				}
+			}
+		}
+	case "dump":
+		cfg := s.DumpConfig()
+		data, err := yaml.Marshal(cfg)
+		if err != nil {
+			resp = protocol.Response{Status: "error", Message: fmt.Sprintf("failed to marshal config: %v", err)}
+		} else {
+			resp = protocol.Response{Status: "ok", Message: string(data)}
+		}
 	case "shutdown":
 		resp = protocol.Response{Status: "ok", Message: "Daemon shutting down"}
 		encoder.Encode(resp)
@@ -260,6 +337,77 @@ func (s *Server) handleLegacyRequest(conn net.Conn, encoder *json.Encoder, req *
 	}
 
 	encoder.Encode(resp)
+}
+
+// DumpConfig reconstructs a Config from the current running state.
+func (s *Server) DumpConfig() *config.Config {
+	s.pm.mu.Lock()
+	defer s.pm.mu.Unlock()
+
+	cfg := &config.Config{}
+	for _, tab := range s.layout.Tabs {
+		cfgTab := config.Tab{
+			Name:   tab.Name,
+			Layout: tab.Layout,
+		}
+		for _, pane := range tab.Panes {
+			p, exists := s.pm.processes[pane.Name]
+			if !exists {
+				continue
+			}
+			cfgPane := config.Pane{
+				Name:        p.Name,
+				Commands:    p.Commands,
+				Cwd:         p.Cwd,
+				HealthCheck: p.HCCfg,
+			}
+			cfgTab.Panes = append(cfgTab.Panes, cfgPane)
+		}
+		cfg.Tabs = append(cfg.Tabs, cfgTab)
+	}
+	return cfg
+}
+
+// resolvePreset resolves a preset identifier (label or 1-based index) to a command string.
+func (s *Server) resolvePreset(processName, preset string) (string, error) {
+	s.pm.mu.Lock()
+	p, exists := s.pm.processes[processName]
+	if !exists {
+		s.pm.mu.Unlock()
+		return "", fmt.Errorf("process %s not found", processName)
+	}
+	commands := p.Commands
+	s.pm.mu.Unlock()
+
+	if len(commands) == 0 {
+		return "", fmt.Errorf("no presets configured for %s", processName)
+	}
+
+	// Try label match first
+	for _, cmd := range commands {
+		if cmd.Label != "" && cmd.Label == preset {
+			return cmd.Command, nil
+		}
+	}
+
+	// Try numeric index
+	if idx, err := strconv.Atoi(preset); err == nil && idx >= 1 && idx <= len(commands) {
+		return commands[idx-1].Command, nil
+	}
+
+	return "", fmt.Errorf("preset %q not found for %s (available: %s)", preset, processName, formatPresetNames(commands))
+}
+
+func formatPresetNames(commands []config.CommandEntry) string {
+	var names []string
+	for i, cmd := range commands {
+		if cmd.Label != "" {
+			names = append(names, fmt.Sprintf("%d:%s", i+1, cmd.Label))
+		} else {
+			names = append(names, fmt.Sprintf("%d", i+1))
+		}
+	}
+	return strings.Join(names, ", ")
 }
 
 // getPaneName converts a PaneID to its name
@@ -326,6 +474,13 @@ func (s *Server) getLayoutMsgWithStatus() *protocol.LayoutMsg {
 				layout.Tabs[i].Panes[j].Command = p.Command
 				layout.Tabs[i].Panes[j].Running = p.Running
 				layout.Tabs[i].Panes[j].Status = string(p.Status)
+				// Populate command presets
+				for _, ce := range p.Commands {
+					layout.Tabs[i].Panes[j].Commands = append(layout.Tabs[i].Panes[j].Commands, protocol.PaneCommand{
+						Label:   ce.Label,
+						Command: ce.Command,
+					})
+				}
 			}
 		}
 	}

@@ -453,8 +453,15 @@ func (bw *BinaryWriter) encodeLayout(l *LayoutMsg) {
 		for _, pane := range tab.Panes {
 			bw.appendU32(uint32(pane.ID))
 			bw.appendString(pane.Name)
+			bw.appendString(pane.Command)
 			bw.appendBool(pane.Running)
 			bw.appendString(pane.Status)
+			// Commands list
+			bw.appendU8(uint8(len(pane.Commands)))
+			for _, cmd := range pane.Commands {
+				bw.appendString(cmd.Label)
+				bw.appendString(cmd.Command)
+			}
 		}
 	}
 }
@@ -475,8 +482,18 @@ func decodeLayout(data []byte) (*LayoutMsg, error) {
 		for j := range l.Tabs[i].Panes {
 			l.Tabs[i].Panes[j].ID = PaneID(r.readU32())
 			l.Tabs[i].Panes[j].Name = r.readString()
+			l.Tabs[i].Panes[j].Command = r.readString()
 			l.Tabs[i].Panes[j].Running = r.readBool()
 			l.Tabs[i].Panes[j].Status = r.readString()
+			// Commands list
+			cmdCount := r.readU8()
+			if cmdCount > 0 {
+				l.Tabs[i].Panes[j].Commands = make([]PaneCommand, cmdCount)
+				for k := range l.Tabs[i].Panes[j].Commands {
+					l.Tabs[i].Panes[j].Commands[k].Label = r.readString()
+					l.Tabs[i].Panes[j].Commands[k].Command = r.readString()
+				}
+			}
 		}
 	}
 	return l, r.err
@@ -660,6 +677,9 @@ func (bw *BinaryWriter) encodeProcessControl(m *ProcessControlMsg) {
 	}
 	bw.appendU32(uint32(m.PaneID))
 	bw.appendU8(uint8(m.Action))
+	if m.Action == ProcessUpdateCommand {
+		bw.appendString(m.Command)
+	}
 }
 
 func decodeProcessControl(data []byte) (*ProcessControlMsg, error) {
@@ -667,6 +687,9 @@ func decodeProcessControl(data []byte) (*ProcessControlMsg, error) {
 	m := &ProcessControlMsg{
 		PaneID: PaneID(r.readU32()),
 		Action: ProcessAction(r.readU8()),
+	}
+	if m.Action == ProcessUpdateCommand {
+		m.Command = r.readString()
 	}
 	return m, r.err
 }
