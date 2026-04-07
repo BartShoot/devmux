@@ -51,6 +51,7 @@ nfpms:
       - devmux-cli-linux
     formats:
       - deb
+    file_name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
     contents:
       - src: third_party/ghostty/lib/linux/libghostty-vt.so*
         dst: /usr/lib/devmux/
