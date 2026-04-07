@@ -19,27 +19,11 @@ builds:
     ldflags:
       - -s -w
 
-  # 2. THE DAEMON - WINDOWS
-  # NOTE: Can only be built natively on Windows (needs Windows headers for CGO).
-  # Uncomment when building on Windows or in CI with a Windows runner.
-  # - id: devmuxd-windows
-  #   main: ./cmd/devmuxd
-  #   binary: devmuxd
-  #   goos: [windows]
-  #   goarch: [amd64]
-  #   env:
-  #     - CGO_ENABLED=1
-  #     - CC=zig cc
-  #   flags:
-  #     - -tags=ghostty
-  #   ldflags:
-  #     - -s -w
-
-  # 3. THE CLI (Pure Go - works for both)
-  - id: devmux-cli
+  # 2. THE CLI (Pure Go)
+  - id: devmux-cli-linux
     main: ./cmd/devmux
     binary: devmux
-    goos: [linux, windows]
+    goos: [linux]
     goarch: [amd64]
     env:
       - CGO_ENABLED=0
@@ -50,20 +34,11 @@ archives:
   - name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
     ids:
       - devmuxd-linux
-      # - devmuxd-windows
-      - devmux-cli
-    allow_different_binary_count: true
-    format_overrides:
-      - goos: linux
-        formats: [tar.gz]
-      - goos: windows
-        formats: [zip]
+      - devmux-cli-linux
+    format: tar.gz
     files:
       - src: third_party/ghostty/lib/linux/libghostty-vt.so*
         dst: lib
-        strip_parent: true
-      - src: third_party/ghostty/lib/windows/*.dll
-        dst: .
         strip_parent: true
 
 nfpms:
@@ -73,7 +48,7 @@ nfpms:
     description: "Terminal process manager and multiplexer."
     builds:
       - devmuxd-linux
-      - devmux-cli
+      - devmux-cli-linux
     formats:
       - deb
     contents:

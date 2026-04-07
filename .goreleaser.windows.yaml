@@ -1,0 +1,44 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+    - go run scripts/build_deps.go
+
+builds:
+  # 1. THE DAEMON - WINDOWS
+  - id: devmuxd-windows
+    main: ./cmd/devmuxd
+    binary: devmuxd
+    goos: [windows]
+    goarch: [amd64]
+    env:
+      - CGO_ENABLED=1
+      - CC=zig cc
+      - CXX=zig c++
+    flags:
+      - -tags=ghostty
+    ldflags:
+      - -s -w
+
+  # 2. THE CLI (Pure Go)
+  - id: devmux-cli-windows
+    main: ./cmd/devmux
+    binary: devmux
+    goos: [windows]
+    goarch: [amd64]
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+
+archives:
+  - name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    ids:
+      - devmuxd-windows
+      - devmux-cli-windows
+    format: zip
+    files:
+      - src: third_party/ghostty/lib/windows/*.dll
+        dst: .
+        strip_parent: true
