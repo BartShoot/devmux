@@ -23,7 +23,7 @@ type buildTarget struct {
 }
 
 var buildTargets = []buildTarget{
-	{"linux", "x86_64-linux", filepath.Join(ghosttyOut, "lib", "linux"), "libghostty-vt.so"},
+	{"linux", "", filepath.Join(ghosttyOut, "lib", "linux"), "libghostty-vt.so"},
 	{"windows", "x86_64-windows", filepath.Join(ghosttyOut, "lib", "windows"), "ghostty-vt.lib"},
 }
 
@@ -38,18 +38,24 @@ func main() {
 		}
 	}
 	if allBuilt {
-		fmt.Println("libghostty-vt already built for all targets, skipping")
+		fmt.Println("libghostty-vt already built for all targets, ensuring headers are synced...")
+		copyLibs(buildTargets[0].libDir)
 		return
 	}
 
 	fmt.Println("Building libghostty-vt...")
+	needsCopy := false
 	for _, t := range buildTargets {
 		if _, err := os.Stat(filepath.Join(t.libDir, t.check)); err == nil {
-			fmt.Printf("  %s: already built, skipping\n", t.name)
+			fmt.Printf("  %s: already built\n", t.name)
+			needsCopy = true
 			continue
 		}
 		fmt.Printf("  %s: building...\n", t.name)
-		args := []string{"build", "-Demit-lib-vt=true", "-Doptimize=ReleaseFast", "-Dtarget=" + t.zigTarget}
+		args := []string{"build", "-Demit-lib-vt=true", "-Doptimize=ReleaseFast"}
+		if t.zigTarget != "" {
+			args = append(args, "-Dtarget="+t.zigTarget)
+		}
 		cmd := exec.Command("zig", args...)
 		cmd.Dir = ghosttySrc
 		cmd.Stdout = os.Stdout
@@ -58,9 +64,15 @@ func main() {
 			fmt.Printf("  %s: build failed (cross-compile not available), skipping: %v\n", t.name, err)
 			continue
 		}
-		copyLibs(t.libDir)
+		needsCopy = true
 	}
-	fmt.Println("libghostty-vt built successfully")
+
+	if needsCopy {
+		// Just use the first available target's lib dir for logic, 
+		// but copyLibs handles its own logic for headers and all lib types.
+		copyLibs(buildTargets[0].libDir) 
+	}
+	fmt.Println("libghostty-vt setup completed")
 }
 
 func copyLibs(destLibDir string) {
@@ -68,22 +80,28 @@ func copyLibs(destLibDir string) {
 	zigOutBin := filepath.Join(ghosttySrc, "zig-out", "bin")
 	zigOutInclude := filepath.Join(ghosttySrc, "zig-out", "include")
 
+	linuxLibDir := filepath.Join(ghosttyOut, "lib", "linux")
+	windowsLibDir := filepath.Join(ghosttyOut, "lib", "windows")
+
 	// Copy all library files (Linux .so/.a)
 	if entries, _ := filepath.Glob(filepath.Join(zigOutLib, "libghostty-vt.*")); len(entries) > 0 {
+		os.MkdirAll(linuxLibDir, 0o755)
 		for _, src := range entries {
-			copyFile(src, filepath.Join(destLibDir, filepath.Base(src)))
+			copyFile(src, filepath.Join(linuxLibDir, filepath.Base(src)))
 		}
 	}
 	// Windows .lib files
 	if entries, _ := filepath.Glob(filepath.Join(zigOutLib, "ghostty-vt.*")); len(entries) > 0 {
+		os.MkdirAll(windowsLibDir, 0o755)
 		for _, src := range entries {
-			copyFile(src, filepath.Join(destLibDir, filepath.Base(src)))
+			copyFile(src, filepath.Join(windowsLibDir, filepath.Base(src)))
 		}
 	}
 	// Windows DLLs
 	if dlls, _ := filepath.Glob(filepath.Join(zigOutBin, "*.dll")); len(dlls) > 0 {
+		os.MkdirAll(windowsLibDir, 0o755)
 		for _, src := range dlls {
-			copyFile(src, filepath.Join(destLibDir, filepath.Base(src)))
+			copyFile(src, filepath.Join(windowsLibDir, filepath.Base(src)))
 		}
 	}
 
@@ -92,9 +110,20 @@ func copyLibs(destLibDir string) {
 		for _, e := range entries {
 			src := filepath.Join(zigOutInclude, e.Name())
 			dst := filepath.Join(includeDir, e.Name())
-			// Remove existing to avoid cp -r nesting dirs inside dirs
+			// Remove existing to avoid nesting
 			os.RemoveAll(dst)
-			cp := exec.Command("cp", "-r", src, dst)
+			
+			// Use xcopy on Windows, cp on others
+			var cp *exec.Cmd
+			if os.PathSeparator == '\\' {
+				// /E - Copies directories and subdirectories, including empty ones.
+				// /I - If destination does not exist and copying more than one file, 
+				//      assumes that destination must be a directory.
+				// /Y - Suppresses prompting to confirm you want to overwrite an existing destination file.
+				cp = exec.Command("xcopy", "/E", "/I", "/Y", src, dst+"\\")
+			} else {
+				cp = exec.Command("cp", "-r", src, dst)
+			}
 			cp.Run()
 		}
 	}

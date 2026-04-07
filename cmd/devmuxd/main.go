@@ -59,7 +59,7 @@ func main() {
 
 			cwd := cfg.ResolveCwd(tab, pane)
 			fmt.Printf("Starting process: %s (cwd: %s)\n", pane.Name, cwd)
-			if err := pm.StartProcess(pane.Name, pane.Command, cwd, pane.HealthCheck); err != nil {
+			if err := pm.StartProcess(pane.Name, pane.Commands[0].Command, cwd, pane.HealthCheck, pane.Commands); err != nil {
 				log.Printf("Failed to start process %s: %v", pane.Name, err)
 			}
 		}

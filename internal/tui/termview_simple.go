@@ -16,7 +16,8 @@ type SimpleTerminalView struct {
 	*tview.Box
 	paneID    protocol.PaneID
 	name      string
-	command   string // process command (for display in overlay)
+	command   string              // currently active command (for display in overlay)
+	commands  []protocol.PaneCommand // available command presets
 	cells     []protocol.CellData
 	cols      int // terminal cols from daemon
 	rows      int // terminal rows from daemon
@@ -27,6 +28,9 @@ type SimpleTerminalView struct {
 	selection *protocol.SelectionMsg
 	running   bool
 	focused   bool
+	dragging  bool // mouse press captured
+	dragged   bool // actual mouse movement occurred during press
+	client    *StreamClient
 	mu        sync.RWMutex
 }
 
@@ -260,11 +264,75 @@ func (tv *SimpleTerminalView) InputHandler() func(event *tcell.EventKey, setFocu
 // MouseHandler returns the mouse handler for this primitive
 func (tv *SimpleTerminalView) MouseHandler() func(action tview.MouseAction, event *tcell.EventMouse, setFocus func(p tview.Primitive)) (consumed bool, capture tview.Primitive) {
 	return tv.WrapMouseHandler(func(action tview.MouseAction, event *tcell.EventMouse, setFocus func(p tview.Primitive)) (consumed bool, capture tview.Primitive) {
-		// Focus on click
-		if action == tview.MouseLeftClick {
+		sx, sy := event.Position()
+		ix, iy, iw, ih := tv.GetInnerRect()
+
+		// Convert screen coords to pane-relative, clamped to pane bounds
+		relX := sx - ix
+		relY := sy - iy
+		if relX < 0 {
+			relX = 0
+		} else if relX >= iw {
+			relX = iw - 1
+		}
+		if relY < 0 {
+			relY = 0
+		} else if relY >= ih {
+			relY = ih - 1
+		}
+
+		switch action {
+		case tview.MouseLeftDown:
+			if !tv.InRect(sx, sy) {
+				return false, nil
+			}
+			setFocus(tv)
+			tv.mu.Lock()
+			tv.dragging = true
+			tv.dragged = false
+			tv.mu.Unlock()
+			if tv.client != nil {
+				go tv.client.SendMouse(tv.paneID, protocol.MousePress, relX, relY)
+			}
+			return true, tv // capture subsequent events
+
+		case tview.MouseMove:
+			tv.mu.Lock()
+			dragging := tv.dragging
+			if dragging {
+				tv.dragged = true
+			}
+			tv.mu.Unlock()
+			if !dragging {
+				return false, nil
+			}
+			if tv.client != nil {
+				go tv.client.SendMouse(tv.paneID, protocol.MouseDrag, relX, relY)
+			}
+			return true, tv // keep capture
+
+		case tview.MouseLeftUp:
+			tv.mu.Lock()
+			dragging := tv.dragging
+			dragged := tv.dragged
+			tv.dragging = false
+			tv.dragged = false
+			tv.mu.Unlock()
+			if !dragging {
+				return false, nil
+			}
+			if dragged {
+				if tv.client != nil {
+					go tv.client.SendMouse(tv.paneID, protocol.MouseRelease, relX, relY)
+				}
+			}
+			return true, nil // release capture
+
+		case tview.MouseLeftClick:
 			setFocus(tv)
 			return true, nil
 		}
+
 		return false, nil
 	})
 }

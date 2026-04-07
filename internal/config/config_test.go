@@ -9,13 +9,22 @@ import (
 	"time"
 )
 
+func cmds(s ...string) []CommandEntry {
+	var entries []CommandEntry
+	for _, c := range s {
+		entries = append(entries, CommandEntry{Command: c})
+	}
+	return entries
+}
+
 func TestLoad_ValidConfig(t *testing.T) {
 	content := `
 tabs:
   - name: "Test"
     panes:
       - name: "App"
-        command: "ls"
+        commands:
+          - "ls"
         health_check:
           type: "http"
           url: "http://localhost:8080"
@@ -50,8 +59,55 @@ tabs:
 	}
 
 	pane := tab.Panes[0]
+	if len(pane.Commands) != 1 || pane.Commands[0].Command != "ls" {
+		t.Errorf("Expected commands [ls], got %v", pane.Commands)
+	}
 	if pane.HealthCheck.Interval != 1*time.Second {
 		t.Errorf("Expected interval 1s, got %v", pane.HealthCheck.Interval)
+	}
+}
+
+func TestLoad_LabeledCommands(t *testing.T) {
+	content := `
+tabs:
+  - name: "Test"
+    panes:
+      - name: "App"
+        commands:
+          - normal: "go run ./cmd/server"
+          - debug: "go run ./cmd/server -debug"
+          - "plain command"
+`
+	tmpfile, err := os.CreateTemp("", "devmux-test-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if _, err := tmpfile.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tmpfile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(tmpfile.Name())
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	pane := cfg.Tabs[0].Panes[0]
+	if len(pane.Commands) != 3 {
+		t.Fatalf("Expected 3 commands, got %d", len(pane.Commands))
+	}
+	if pane.Commands[0].Label != "normal" || pane.Commands[0].Command != "go run ./cmd/server" {
+		t.Errorf("Command 0: got %+v", pane.Commands[0])
+	}
+	if pane.Commands[1].Label != "debug" || pane.Commands[1].Command != "go run ./cmd/server -debug" {
+		t.Errorf("Command 1: got %+v", pane.Commands[1])
+	}
+	if pane.Commands[2].Label != "" || pane.Commands[2].Command != "plain command" {
+		t.Errorf("Command 2: got %+v", pane.Commands[2])
 	}
 }
 
@@ -143,7 +199,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "tab without name",
 			config: Config{Tabs: []Tab{
-				{Panes: []Pane{{Name: "p", Command: "ls"}}},
+				{Panes: []Pane{{Name: "p", Commands: cmds("ls")}}},
 			}},
 			wantErr: true,
 			errMsgs: []string{"missing name"},
@@ -159,24 +215,24 @@ func TestValidate(t *testing.T) {
 		{
 			name: "pane without name",
 			config: Config{Tabs: []Tab{
-				{Name: "t", Panes: []Pane{{Command: "ls"}}},
+				{Name: "t", Panes: []Pane{{Commands: cmds("ls")}}},
 			}},
 			wantErr: true,
 			errMsgs: []string{"missing name"},
 		},
 		{
-			name: "pane without command",
+			name: "pane without commands",
 			config: Config{Tabs: []Tab{
 				{Name: "t", Panes: []Pane{{Name: "p"}}},
 			}},
 			wantErr: true,
-			errMsgs: []string{"missing command"},
+			errMsgs: []string{"missing commands"},
 		},
 		{
 			name: "duplicate pane names",
 			config: Config{Tabs: []Tab{
-				{Name: "t1", Panes: []Pane{{Name: "p", Command: "ls"}}},
-				{Name: "t2", Panes: []Pane{{Name: "p", Command: "ls"}}},
+				{Name: "t1", Panes: []Pane{{Name: "p", Commands: cmds("ls")}}},
+				{Name: "t2", Panes: []Pane{{Name: "p", Commands: cmds("ls")}}},
 			}},
 			wantErr: true,
 			errMsgs: []string{"duplicate pane name"},
@@ -184,7 +240,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "unknown health check type",
 			config: Config{Tabs: []Tab{
-				{Name: "t", Panes: []Pane{{Name: "p", Command: "ls", HealthCheck: HealthCheck{Type: "magic"}}}},
+				{Name: "t", Panes: []Pane{{Name: "p", Commands: cmds("ls"), HealthCheck: HealthCheck{Type: "magic"}}}},
 			}},
 			wantErr: true,
 			errMsgs: []string{"unknown health check type"},
@@ -192,7 +248,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "http health check missing url",
 			config: Config{Tabs: []Tab{
-				{Name: "t", Panes: []Pane{{Name: "p", Command: "ls", HealthCheck: HealthCheck{Type: "http", Interval: time.Second, Timeout: time.Second}}}},
+				{Name: "t", Panes: []Pane{{Name: "p", Commands: cmds("ls"), HealthCheck: HealthCheck{Type: "http", Interval: time.Second, Timeout: time.Second}}}},
 			}},
 			wantErr: true,
 			errMsgs: []string{"requires url"},
@@ -200,7 +256,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "tcp health check missing address",
 			config: Config{Tabs: []Tab{
-				{Name: "t", Panes: []Pane{{Name: "p", Command: "ls", HealthCheck: HealthCheck{Type: "tcp", Interval: time.Second, Timeout: time.Second}}}},
+				{Name: "t", Panes: []Pane{{Name: "p", Commands: cmds("ls"), HealthCheck: HealthCheck{Type: "tcp", Interval: time.Second, Timeout: time.Second}}}},
 			}},
 			wantErr: true,
 			errMsgs: []string{"requires address"},
@@ -208,7 +264,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "regex health check missing pattern",
 			config: Config{Tabs: []Tab{
-				{Name: "t", Panes: []Pane{{Name: "p", Command: "ls", HealthCheck: HealthCheck{Type: "regex", Interval: time.Second, Timeout: time.Second}}}},
+				{Name: "t", Panes: []Pane{{Name: "p", Commands: cmds("ls"), HealthCheck: HealthCheck{Type: "regex", Interval: time.Second, Timeout: time.Second}}}},
 			}},
 			wantErr: true,
 			errMsgs: []string{"requires pattern"},
@@ -216,7 +272,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "health check missing interval",
 			config: Config{Tabs: []Tab{
-				{Name: "t", Panes: []Pane{{Name: "p", Command: "ls", HealthCheck: HealthCheck{Type: "http", URL: "http://localhost", Timeout: time.Second}}}},
+				{Name: "t", Panes: []Pane{{Name: "p", Commands: cmds("ls"), HealthCheck: HealthCheck{Type: "http", URL: "http://localhost", Timeout: time.Second}}}},
 			}},
 			wantErr: true,
 			errMsgs: []string{"interval must be positive"},
@@ -227,19 +283,19 @@ func TestValidate(t *testing.T) {
 				{Panes: []Pane{{}, {Name: "p"}}},
 			}},
 			wantErr: true,
-			errMsgs: []string{"missing name", "missing command"},
+			errMsgs: []string{"missing name", "missing commands"},
 		},
 		{
 			name: "valid minimal config",
 			config: Config{Tabs: []Tab{
-				{Name: "t", Panes: []Pane{{Name: "p", Command: "ls"}}},
+				{Name: "t", Panes: []Pane{{Name: "p", Commands: cmds("ls")}}},
 			}},
 			wantErr: false,
 		},
 		{
 			name: "valid config with health checks",
 			config: Config{Tabs: []Tab{
-				{Name: "t", Panes: []Pane{{Name: "p", Command: "ls", HealthCheck: HealthCheck{
+				{Name: "t", Panes: []Pane{{Name: "p", Commands: cmds("ls"), HealthCheck: HealthCheck{
 					Type: "http", URL: "http://localhost", Interval: time.Second, Timeout: 5 * time.Second,
 				}}}},
 			}},
@@ -248,7 +304,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "pane without health check is valid",
 			config: Config{Tabs: []Tab{
-				{Name: "t", Panes: []Pane{{Name: "p", Command: "ls"}}},
+				{Name: "t", Panes: []Pane{{Name: "p", Commands: cmds("ls")}}},
 			}},
 			wantErr: false,
 		},

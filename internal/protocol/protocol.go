@@ -38,11 +38,15 @@ func GetSocketNetwork() string {
 // ============================================================================
 
 type Request struct {
-	Command string `json:"command"`
-	Name    string `json:"name,omitempty"`
-	Offset  int    `json:"offset,omitempty"`
-	Tail    int    `json:"tail,omitempty"` // for "logs" command - return only last N lines
-	Input   string `json:"input,omitempty"` // for "input" command - data to send to process stdin
+	Command     string `json:"command"`
+	Name        string `json:"name,omitempty"`
+	Offset      int    `json:"offset,omitempty"`
+	Tail        int    `json:"tail,omitempty"`         // for "logs" command - return only last N lines
+	Input       string `json:"input,omitempty"`        // for "input" command - data to send to process stdin
+	NewCommand  string `json:"new_command,omitempty"`  // for "update" command - new command to run
+	Preset      string `json:"preset,omitempty"`       // for "update" command - preset label or index
+	AddPreset   string `json:"add_preset,omitempty"`   // for "presets" command - command to add
+	PresetLabel string `json:"preset_label,omitempty"` // for "presets" command - label for added preset
 }
 
 type Response struct {
@@ -179,15 +183,17 @@ type ScrollMsg struct {
 type ProcessAction uint8
 
 const (
-	ProcessStop    ProcessAction = 1
-	ProcessStart   ProcessAction = 2
-	ProcessRestart ProcessAction = 3
+	ProcessStop          ProcessAction = 1
+	ProcessStart         ProcessAction = 2
+	ProcessRestart       ProcessAction = 3
+	ProcessUpdateCommand ProcessAction = 4
 )
 
 // ProcessControlMsg requests a process lifecycle action
 type ProcessControlMsg struct {
-	PaneID PaneID        `json:"pane_id"`
-	Action ProcessAction `json:"action"`
+	PaneID  PaneID        `json:"pane_id"`
+	Action  ProcessAction `json:"action"`
+	Command string        `json:"command,omitempty"` // new command for UpdateCommand action
 }
 
 // ScrollInfo describes viewport scroll position (included in ScreenUpdate)
@@ -210,13 +216,20 @@ type TabInfo struct {
 	Panes  []PaneInfo `json:"panes"`
 }
 
+// PaneCommand represents a command preset with optional label.
+type PaneCommand struct {
+	Label   string `json:"label,omitempty"`
+	Command string `json:"command"`
+}
+
 // PaneInfo describes a pane with numerical ID
 type PaneInfo struct {
-	ID      PaneID `json:"id"`
-	Name    string `json:"name"`
-	Command string `json:"command,omitempty"`
-	Running bool   `json:"running"`
-	Status  string `json:"status"`
+	ID       PaneID        `json:"id"`
+	Name     string        `json:"name"`
+	Command  string        `json:"command,omitempty"`
+	Commands []PaneCommand `json:"commands,omitempty"` // available presets
+	Running  bool          `json:"running"`
+	Status   string        `json:"status"`
 }
 
 // ScreenUpdate contains terminal screen state pushed from daemon
