@@ -478,20 +478,24 @@ func waitForDaemon(cmd *exec.Cmd, stderr *bytes.Buffer) error {
 	}
 }
 
-// waitForHealthyStatus polls the daemon until the process becomes healthy
+// waitForHealthyStatus polls the daemon until the process becomes healthy or exits
 func waitForHealthyStatus(name string) error {
 	timeout := 5 * time.Minute
 	interval := 1 * time.Second
 	deadline := time.Now().Add(timeout)
 
 	for time.Now().Before(deadline) {
-		status, err := getProcessStatus(name)
+		ps, err := getProcessStatus(name)
 		if err != nil {
 			return err
 		}
 
-		if status == "Healthy" {
+		if ps.Health == "Healthy" {
 			return nil
+		}
+
+		if !ps.Running {
+			return fmt.Errorf("process %s exited before becoming healthy", name)
 		}
 
 		time.Sleep(interval)
@@ -500,22 +504,28 @@ func waitForHealthyStatus(name string) error {
 	return fmt.Errorf("timeout waiting for %s to become healthy", name)
 }
 
-// getProcessStatus queries the daemon for a process's health status
-func getProcessStatus(name string) (string, error) {
+// processStatus holds the parsed health status and running state of a process.
+type processStatus struct {
+	Health  string
+	Running bool
+}
+
+// getProcessStatus queries the daemon for a process's health and running status.
+func getProcessStatus(name string) (processStatus, error) {
 	conn, err := net.Dial(protocol.GetSocketNetwork(), protocol.GetSocketPath())
 	if err != nil {
-		return "", fmt.Errorf("failed to connect to daemon: %w", err)
+		return processStatus{}, fmt.Errorf("failed to connect to daemon: %w", err)
 	}
 	defer conn.Close()
 
 	req := protocol.Request{Command: "status"}
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		return "", fmt.Errorf("failed to send request: %w", err)
+		return processStatus{}, fmt.Errorf("failed to send request: %w", err)
 	}
 
 	var resp protocol.Response
 	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		return "", fmt.Errorf("failed to read response: %w", err)
+		return processStatus{}, fmt.Errorf("failed to read response: %w", err)
 	}
 
 	// Parse status message to find the process
@@ -525,16 +535,20 @@ func getProcessStatus(name string) (string, error) {
 			parts := strings.SplitN(line, ":", 2)
 			if len(parts) == 2 {
 				statusPart := strings.TrimSpace(parts[1])
+				var ps processStatus
 				// Extract status before " (Running:"
 				if idx := strings.Index(statusPart, " ("); idx > 0 {
-					return statusPart[:idx], nil
+					ps.Health = statusPart[:idx]
+					ps.Running = strings.Contains(statusPart[idx:], "Running: true")
+				} else {
+					ps.Health = statusPart
 				}
-				return statusPart, nil
+				return ps, nil
 			}
 		}
 	}
 
-	return "", fmt.Errorf("process %s not found in status", name)
+	return processStatus{}, fmt.Errorf("process %s not found in status", name)
 }
 
 // grepLines filters lines by pattern with optional before/after context.
