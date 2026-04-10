@@ -2,10 +2,15 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"os/exec"
 	"regexp"
+	"strings"
+
+	"github.com/itchyny/gojq"
 
 	"devmux/internal/config"
 )
@@ -38,6 +43,8 @@ func (hc *HealthChecker) Check(ctx context.Context) (HealthStatus, error) {
 		return hc.checkTCP(ctx)
 	case "regex":
 		return hc.checkRegex(ctx)
+	case "docker":
+		return hc.checkDocker(ctx)
 	default:
 		return StatusUnhealthy, fmt.Errorf("unknown health check type: %s", hc.config.Type)
 	}
@@ -58,10 +65,37 @@ func (hc *HealthChecker) checkHTTP(ctx context.Context) (HealthStatus, error) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return StatusUnhealthy, fmt.Errorf("HTTP status: %d", resp.StatusCode)
+	}
+
+	if hc.config.JQ == "" {
 		return StatusHealthy, nil
 	}
-	return StatusUnhealthy, fmt.Errorf("HTTP status: %d", resp.StatusCode)
+
+	var body interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return StatusUnhealthy, fmt.Errorf("failed to parse JSON response: %w", err)
+	}
+
+	query, err := gojq.Parse(hc.config.JQ)
+	if err != nil {
+		return StatusUnhealthy, fmt.Errorf("invalid jq expression: %w", err)
+	}
+
+	iter := query.Run(body)
+	v, ok := iter.Next()
+	if !ok {
+		return StatusUnhealthy, fmt.Errorf("jq expression produced no output")
+	}
+	if err, isErr := v.(error); isErr {
+		return StatusUnhealthy, fmt.Errorf("jq evaluation error: %w", err)
+	}
+
+	if result, ok := v.(bool); ok && result {
+		return StatusHealthy, nil
+	}
+	return StatusUnhealthy, fmt.Errorf("jq expression evaluated to %v (expected true)", v)
 }
 
 func (hc *HealthChecker) checkTCP(ctx context.Context) (HealthStatus, error) {
@@ -87,4 +121,19 @@ func (hc *HealthChecker) checkRegex(ctx context.Context) (HealthStatus, error) {
 		}
 	}
 	return StatusUnhealthy, nil
+}
+
+func (hc *HealthChecker) checkDocker(ctx context.Context) (HealthStatus, error) {
+	cmd := exec.CommandContext(ctx, "docker", "inspect",
+		"--format", "{{.State.Health.Status}}", hc.config.Container)
+	out, err := cmd.Output()
+	if err != nil {
+		return StatusUnhealthy, fmt.Errorf("docker inspect failed: %w", err)
+	}
+
+	status := strings.TrimSpace(string(out))
+	if status == "healthy" {
+		return StatusHealthy, nil
+	}
+	return StatusUnhealthy, fmt.Errorf("container health: %s", status)
 }

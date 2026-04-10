@@ -308,6 +308,42 @@ func TestValidate(t *testing.T) {
 			}},
 			wantErr: false,
 		},
+		{
+			name: "docker health check missing container",
+			config: Config{Tabs: []Tab{
+				{Name: "t", Panes: []Pane{{Name: "p", Commands: cmds("ls"), HealthCheck: HealthCheck{Type: "docker", Interval: time.Second, Timeout: time.Second}}}},
+			}},
+			wantErr: true,
+			errMsgs: []string{"requires container"},
+		},
+		{
+			name: "valid docker health check",
+			config: Config{Tabs: []Tab{
+				{Name: "t", Panes: []Pane{{Name: "p", Commands: cmds("ls"), HealthCheck: HealthCheck{
+					Type: "docker", Container: "my_app", Interval: time.Second, Timeout: 5 * time.Second,
+				}}}},
+			}},
+			wantErr: false,
+		},
+		{
+			name: "valid http health check with jq",
+			config: Config{Tabs: []Tab{
+				{Name: "t", Panes: []Pane{{Name: "p", Commands: cmds("ls"), HealthCheck: HealthCheck{
+					Type: "http", URL: "http://localhost", JQ: `.status == "OK"`, Interval: time.Second, Timeout: 5 * time.Second,
+				}}}},
+			}},
+			wantErr: false,
+		},
+		{
+			name: "jq on non-http type is invalid",
+			config: Config{Tabs: []Tab{
+				{Name: "t", Panes: []Pane{{Name: "p", Commands: cmds("ls"), HealthCheck: HealthCheck{
+					Type: "tcp", Address: "localhost:8080", JQ: ".status", Interval: time.Second, Timeout: 5 * time.Second,
+				}}}},
+			}},
+			wantErr: true,
+			errMsgs: []string{"jq expression is only supported with health check type \"http\""},
+		},
 	}
 
 	for _, tt := range tests {

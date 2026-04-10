@@ -119,12 +119,14 @@ func (p *Pane) UnmarshalYAML(value *yaml.Node) error {
 }
 
 type HealthCheck struct {
-	Type     string        `yaml:"type"`
-	URL      string        `yaml:"url,omitempty"`
-	Address  string        `yaml:"address,omitempty"`
-	Pattern  string        `yaml:"pattern,omitempty"`
-	Interval time.Duration `yaml:"interval"`
-	Timeout  time.Duration `yaml:"timeout"`
+	Type      string        `yaml:"type"`
+	URL       string        `yaml:"url,omitempty"`
+	Address   string        `yaml:"address,omitempty"`
+	Pattern   string        `yaml:"pattern,omitempty"`
+	JQ        string        `yaml:"jq,omitempty"`
+	Container string        `yaml:"container,omitempty"`
+	Interval  time.Duration `yaml:"interval"`
+	Timeout   time.Duration `yaml:"timeout"`
 }
 
 func Load(path string) (*Config, error) {
@@ -219,8 +221,16 @@ func validateHealthCheck(hc HealthCheck, prefix string) string {
 		if hc.Pattern == "" {
 			return fmt.Sprintf("%s: health check type %q requires pattern", prefix, hc.Type)
 		}
+	case "docker":
+		if hc.Container == "" {
+			return fmt.Sprintf("%s: health check type %q requires container", prefix, hc.Type)
+		}
 	default:
-		return fmt.Sprintf("%s: unknown health check type %q (must be http, tcp, or regex)", prefix, hc.Type)
+		return fmt.Sprintf("%s: unknown health check type %q (must be http, tcp, regex, or docker)", prefix, hc.Type)
+	}
+
+	if hc.JQ != "" && hc.Type != "http" {
+		return fmt.Sprintf("%s: jq expression is only supported with health check type \"http\"", prefix)
 	}
 
 	if hc.Interval <= 0 {
