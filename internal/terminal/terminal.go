@@ -20,6 +20,79 @@ static inline GhosttyTerminalOptions make_terminal_opts(uint16_t cols, uint16_t 
 	opts.max_scrollback = max_scrollback;
 	return opts;
 }
+
+// Flat, padding-free cell used to hand a whole row across the CGO boundary
+// in a single call. Reading cells one attribute at a time from Go costs ~6
+// CGO crossings per cell; devmux_read_row does the inner loop in C so each
+// row costs one crossing instead of cols*6.
+typedef struct {
+	uint32_t codepoint; // base grapheme codepoint (0 => empty cell)
+	uint8_t  fg_r, fg_g, fg_b;
+	uint8_t  bg_r, bg_g, bg_b;
+	uint8_t  fg_default; // 1 if the cell has no explicit foreground
+	uint8_t  bg_default; // 1 if the cell has no explicit background
+	uint8_t  flags;      // see DEVMUX_CELL_* below
+} DevmuxCell;
+
+enum {
+	DEVMUX_CELL_BOLD          = 1 << 0,
+	DEVMUX_CELL_ITALIC        = 1 << 1,
+	DEVMUX_CELL_UNDERLINE     = 1 << 2,
+	DEVMUX_CELL_STRIKETHROUGH = 1 << 3,
+};
+
+// devmux_read_row walks the cells of the current row (the iterator must
+// already be positioned via GHOSTTY_RENDER_STATE_ROW_DATA_CELLS) and writes
+// up to `max` cells into out. Returns the number of cells written.
+//
+// Colors use the resolved FG_COLOR/BG_COLOR keys (palette indices already
+// looked up); a GHOSTTY_INVALID_VALUE result means "use the default color".
+// Only the base codepoint is kept, matching the previous Go behavior.
+static inline size_t devmux_read_row(GhosttyRenderStateRowCells cells, DevmuxCell* out, size_t max) {
+	size_t n = 0;
+	while (n < max && ghostty_render_state_row_cells_next(cells)) {
+		DevmuxCell* c = &out[n];
+
+		// Base codepoint via the raw cell (avoids needing a grapheme buffer
+		// sized to the cluster length).
+		GhosttyCell raw = 0;
+		c->codepoint = 0;
+		if (ghostty_render_state_row_cells_get(cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, &raw) == GHOSTTY_SUCCESS) {
+			uint32_t cp = 0;
+			if (ghostty_cell_get(raw, GHOSTTY_CELL_DATA_CODEPOINT, &cp) == GHOSTTY_SUCCESS) {
+				c->codepoint = cp;
+			}
+		}
+
+		GhosttyColorRgb fg;
+		if (ghostty_render_state_row_cells_get(cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR, &fg) == GHOSTTY_SUCCESS) {
+			c->fg_r = fg.r; c->fg_g = fg.g; c->fg_b = fg.b; c->fg_default = 0;
+		} else {
+			c->fg_r = c->fg_g = c->fg_b = 0; c->fg_default = 1;
+		}
+
+		GhosttyColorRgb bg;
+		if (ghostty_render_state_row_cells_get(cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR, &bg) == GHOSTTY_SUCCESS) {
+			c->bg_r = bg.r; c->bg_g = bg.g; c->bg_b = bg.b; c->bg_default = 0;
+		} else {
+			c->bg_r = c->bg_g = c->bg_b = 0; c->bg_default = 1;
+		}
+
+		GhosttyStyle style;
+		style.size = sizeof(style);
+		uint8_t flags = 0;
+		if (ghostty_render_state_row_cells_get(cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &style) == GHOSTTY_SUCCESS) {
+			if (style.bold)          flags |= DEVMUX_CELL_BOLD;
+			if (style.italic)        flags |= DEVMUX_CELL_ITALIC;
+			if (style.underline != 0) flags |= DEVMUX_CELL_UNDERLINE;
+			if (style.strikethrough) flags |= DEVMUX_CELL_STRIKETHROUGH;
+		}
+		c->flags = flags;
+
+		n++;
+	}
+	return n;
+}
 */
 import "C"
 import (
@@ -41,8 +114,10 @@ type Terminal struct {
 	rowCells    C.GhosttyRenderStateRowCells
 	cols        int
 	rows        int
-	graphemeBuf [8]C.uint32_t // reusable grapheme buffer (avoids per-cell alloc)
-	mu          sync.Mutex
+	graphemeBuf [8]C.uint32_t  // reusable grapheme buffer (avoids per-cell alloc)
+	rowBuf      []C.DevmuxCell // reusable per-row buffer for the batched C reader
+	mu          sync.Mutex     // guards terminal access (Write, Resize, render_state_update)
+	renderMu    sync.Mutex     // guards render-state reads (renderState + iterators + rowBuf)
 }
 
 // New creates a new Terminal with the given dimensions
@@ -87,6 +162,10 @@ func New(cols, rows int) (*Terminal, error) {
 
 // Close releases all resources
 func (t *Terminal) Close() {
+	// Lock order matches the readers (renderMu then mu) to avoid freeing the
+	// render state out from under an in-flight read.
+	t.renderMu.Lock()
+	defer t.renderMu.Unlock()
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -169,10 +248,10 @@ func (t *Terminal) GetScrollbar() (total, offset, length uint64) {
 
 // GetCursor returns the current cursor state
 func (t *Terminal) GetCursor() CursorState {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.renderMu.Lock()
+	defer t.renderMu.Unlock()
 
-	C.ghostty_render_state_update(t.renderState, t.term)
+	t.updateRenderState()
 
 	var visible C.bool
 	var hasValue C.bool
@@ -204,10 +283,10 @@ func (t *Terminal) GetCursor() CursorState {
 // GetScreen returns the current screen content as a 2D grid of cells.
 // Deprecated: use FillScreen for zero-allocation screen reading.
 func (t *Terminal) GetScreen() [][]Cell {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.renderMu.Lock()
+	defer t.renderMu.Unlock()
 
-	C.ghostty_render_state_update(t.renderState, t.term)
+	t.updateRenderState()
 
 	screen := make([][]Cell, t.rows)
 	for i := range screen {
@@ -251,12 +330,31 @@ func (t *Terminal) ForceReadScreen(buf []Cell, cursor *CursorState) {
 	t.fillScreen(buf, cursor, true)
 }
 
-func (t *Terminal) fillScreen(buf []Cell, cursor *CursorState, force bool) bool {
+// updateRenderState refreshes the render state from the terminal. This is the
+// only step that needs access to the terminal instance, so it briefly takes
+// t.mu; callers hold t.renderMu for the duration of the subsequent read so
+// PTY writes (which also take t.mu) can proceed concurrently with the read.
+func (t *Terminal) updateRenderState() {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	// Update render state from terminal (consumes terminal dirty flags)
 	C.ghostty_render_state_update(t.renderState, t.term)
+	t.mu.Unlock()
+}
+
+// rowCellBuf returns a reusable C-side row buffer with at least n cells.
+func (t *Terminal) rowCellBuf(n int) []C.DevmuxCell {
+	if cap(t.rowBuf) < n {
+		t.rowBuf = make([]C.DevmuxCell, n)
+	}
+	return t.rowBuf[:n]
+}
+
+func (t *Terminal) fillScreen(buf []Cell, cursor *CursorState, force bool) bool {
+	t.renderMu.Lock()
+	defer t.renderMu.Unlock()
+
+	// Update render state from terminal (consumes terminal dirty flags).
+	// Only this call touches the terminal; the reads below hit render state.
+	t.updateRenderState()
 
 	// Check global dirty state
 	var dirty C.GhosttyRenderStateDirty
@@ -314,14 +412,16 @@ func (t *Terminal) fillScreen(buf []Cell, cursor *CursorState, force bool) bool 
 
 		C.ghostty_render_state_row_get(t.rowIter, C.GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, unsafe.Pointer(&t.rowCells))
 
-		col := 0
-		for C.ghostty_render_state_row_cells_next(t.rowCells) && col < t.cols {
-			t.readCellInto(&buf[rowOffset+col])
-			col++
+		// Read the whole row in one CGO call.
+		rowBuf := t.rowCellBuf(t.cols)
+		n := int(C.devmux_read_row(t.rowCells, &rowBuf[0], C.size_t(t.cols)))
+
+		for col := 0; col < n; col++ {
+			decodeCell(&rowBuf[col], &buf[rowOffset+col])
 		}
 
 		// Fill remaining cols as empty
-		for col < t.cols {
+		for col := n; col < t.cols; col++ {
 			c := &buf[rowOffset+col]
 			c.Char = ' '
 			c.FG = Color{Default: true}
@@ -330,7 +430,6 @@ func (t *Terminal) fillScreen(buf []Cell, cursor *CursorState, force bool) bool 
 			c.Italic = false
 			c.Underline = false
 			c.Strikethrough = false
-			col++
 		}
 
 		row++
@@ -341,6 +440,35 @@ func (t *Terminal) fillScreen(buf []Cell, cursor *CursorState, force bool) bool 
 	C.ghostty_render_state_set(t.renderState, C.GHOSTTY_RENDER_STATE_OPTION_DIRTY, unsafe.Pointer(&cleanState))
 
 	return true
+}
+
+// decodeCell converts a C-side DevmuxCell (already read in bulk by
+// devmux_read_row) into a Cell. This performs no CGO calls — it is plain
+// memory access into the reusable row buffer.
+func decodeCell(src *C.DevmuxCell, dst *Cell) {
+	if src.codepoint == 0 {
+		dst.Char = ' '
+	} else {
+		dst.Char = rune(src.codepoint)
+	}
+
+	if src.fg_default != 0 {
+		dst.FG = Color{Default: true}
+	} else {
+		dst.FG = Color{R: uint8(src.fg_r), G: uint8(src.fg_g), B: uint8(src.fg_b)}
+	}
+
+	if src.bg_default != 0 {
+		dst.BG = Color{Default: true}
+	} else {
+		dst.BG = Color{R: uint8(src.bg_r), G: uint8(src.bg_g), B: uint8(src.bg_b)}
+	}
+
+	f := uint8(src.flags)
+	dst.Bold = f&uint8(C.DEVMUX_CELL_BOLD) != 0
+	dst.Italic = f&uint8(C.DEVMUX_CELL_ITALIC) != 0
+	dst.Underline = f&uint8(C.DEVMUX_CELL_UNDERLINE) != 0
+	dst.Strikethrough = f&uint8(C.DEVMUX_CELL_STRIKETHROUGH) != 0
 }
 
 // readCellInto reads the current cell from the row cells iterator into dst.
