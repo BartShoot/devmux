@@ -157,12 +157,25 @@ func (c *Config) Validate() error {
 
 	paneNames := make(map[string]bool)
 
+	// Collect tab names up front so pane names can be checked against them.
+	// Tab and pane names share a namespace for `devmux restart <name|tab>`,
+	// so a collision (or a duplicate tab name) makes a target ambiguous.
+	tabNames := make(map[string]bool)
+	for _, tab := range c.Tabs {
+		tabNames[tab.Name] = true
+	}
+
+	seenTabNames := make(map[string]bool)
 	for i, tab := range c.Tabs {
 		prefix := fmt.Sprintf("tabs[%d]", i)
 		if tab.Name == "" {
 			errs = append(errs, fmt.Sprintf("%s: missing name", prefix))
 		} else {
 			prefix = fmt.Sprintf("tab %q", tab.Name)
+			if seenTabNames[tab.Name] {
+				errs = append(errs, fmt.Sprintf("%s: duplicate tab name", prefix))
+			}
+			seenTabNames[tab.Name] = true
 		}
 
 		if len(tab.Panes) == 0 {
@@ -178,6 +191,9 @@ func (c *Config) Validate() error {
 				pprefix = fmt.Sprintf("%s pane %q", prefix, pane.Name)
 				if paneNames[pane.Name] {
 					errs = append(errs, fmt.Sprintf("%s: duplicate pane name", pprefix))
+				}
+				if tabNames[pane.Name] {
+					errs = append(errs, fmt.Sprintf("%s: pane name collides with a tab name", pprefix))
 				}
 				paneNames[pane.Name] = true
 			}

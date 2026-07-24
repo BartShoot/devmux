@@ -238,6 +238,23 @@ func TestValidate(t *testing.T) {
 			errMsgs: []string{"duplicate pane name"},
 		},
 		{
+			name: "pane name collides with tab name",
+			config: Config{Tabs: []Tab{
+				{Name: "backend", Panes: []Pane{{Name: "backend", Commands: cmds("ls")}}},
+			}},
+			wantErr: true,
+			errMsgs: []string{"collides with a tab name"},
+		},
+		{
+			name: "duplicate tab names",
+			config: Config{Tabs: []Tab{
+				{Name: "t", Panes: []Pane{{Name: "p1", Commands: cmds("ls")}}},
+				{Name: "t", Panes: []Pane{{Name: "p2", Commands: cmds("ls")}}},
+			}},
+			wantErr: true,
+			errMsgs: []string{"duplicate tab name"},
+		},
+		{
 			name: "unknown health check type",
 			config: Config{Tabs: []Tab{
 				{Name: "t", Panes: []Pane{{Name: "p", Commands: cmds("ls"), HealthCheck: HealthCheck{Type: "magic"}}}},
